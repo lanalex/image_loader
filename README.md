@@ -47,8 +47,4 @@ df = pd.DataFrame([{'image' : i2}])
 
 # This is a pandas monkey patch added function 
 df.render()
-
-
-
-
 ```
