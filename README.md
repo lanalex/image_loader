@@ -1,8 +1,9 @@
 # Installation 
+Note the --ignore-installed flag. This will prevent installation/upgrade/modification of existing installed libs - especially related to torch/torchvision 
 ```
-git clone https://github.com/lanalex/image_loader.git
+git clone https://github.com/lanalex/image_loader.git 
 cd ./image_loader
-pip3 install -r requirments.txt 
+pip3 install -r requirments.txt   --ignore-installed 
 ```
 
 # Outline 

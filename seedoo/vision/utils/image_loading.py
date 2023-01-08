@@ -7,10 +7,7 @@ import pandas as pd
 import tempfile
 import cv2
 from io import BytesIO
-try:
-    from seedoo.vision.utils.region import Region
-except:
-    print('Can not import')
+from seedoo.vision.utils.region import Region
 
 class PathFrameLoader:
     """
