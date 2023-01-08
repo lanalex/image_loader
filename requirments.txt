@@ -1,0 +1,10 @@
+torch
+torchvision
+Shapely
+Pillow
+pandas
+scikit-image
+scipy
+psycopg2-binary
+opencv-python
+tqdm>=4.41.0
