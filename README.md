@@ -1,3 +1,10 @@
+# Installation 
+```
+git clone https://github.com/lanalex/image_loader.git
+cd ./image_loader
+pip3 install -r requirments.txt 
+```
+
 # Outline 
 This is a tool that wraps several python image libraries for most:
 1) Pillow
@@ -20,24 +27,28 @@ so that only when an image is actually dispaly, it is loaded from disk .
 8) The API uses the best library under the hood to perform the operation in the fastest and easiest way. Sometimes cv2, sometimes pillow, sometimes scikit-image 
 9) The API is use case oriented. It wraps the most common use cases in image analysis / processing so that the high level functions represent those use cases.  
 
-for example 
-
+for example
+(this example can also be found in sample.ipynb)
 ```python
 from seedoo.vision.utils.region import Region
 from seedoo.vision.utils.image_loading import ImageLoader
 import pandas as pd
+path = os.path.dirname(os.path.abspath(seedoo.vision.__file__))
+
+
 
 r1 = Region(row = 0, column = 10, width = 100, height = 100)
 r2 = Region(row = 100, column = 10, width = 100, height = 100)
 
-# If we want to ![img.png](img.png)
-i = ImageLoader(path = './apple.png')
+# If we want to 
+i = ImageLoader(path = os.path.join(path, 'apple.png'))
 i2 = i.draw_regions([r1,r2])
 df = pd.DataFrame([{'image' : i2}])
 
 # This is a pandas monkey patch added function 
 df.render()
-i2 = Region.draw(i, [r1, r2])
+
+
 
 
 ```
