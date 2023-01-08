@@ -32,7 +32,7 @@ for example
 (this example can also be found in sample.ipynb)
 ```python
 from seedoo.vision.utils.region import Region
-from seedoo.vision.utils.image_loading import ImageLoader
+from seedoo.vision.utils.image_loading import ImageLoader, ListOfImageLoaders
 import pandas as pd
 path = os.path.dirname(os.path.abspath(seedoo.vision.__file__))
 
@@ -48,4 +48,9 @@ df = pd.DataFrame([{'image' : i2}])
 
 # This is a pandas monkey patch added function 
 df.render()
+
+g = df.groupby(['id']).agg({'image' : lambda x: ListOfImageLoaders(x.values.tolist(), columns_per_row = 4)})
+g.render()
+
+
 ```
