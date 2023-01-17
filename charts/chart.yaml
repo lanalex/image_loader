@@ -1,1 +1,90 @@
 
+apiVersion: v2
+name: node-red-appsmith
+description: A Helm chart for deploying Node-RED and Appsmith
+version: 0.1.0
+kind: App
+
+# Chart Dependencies
+dependencies:
+  - name: appsmith
+    version: 1.0.0
+    repository: https://charts.appsmith.com
+
+# Define the service and deployment for Node-RED
+services:
+- name: node-red
+  selector:
+    app: node-red
+  ports:
+    - name: http
+      port: 1880
+      targetPort: 1880
+      protocol: TCP
+  type: ClusterIP
+
+deployments:
+- name: node-red
+  replicas: 1
+  selector:
+    matchLabels:
+      app: node-red
+  template:
+    metadata:
+      labels:
+        app: node-red
+    spec:
+      containers:
+        - name: node-red
+          image: nodered/node-red:latest
+          ports:
+            - containerPort: 1880
+          env:
+            - name: FLOWS
+              value: |
+                [{"id":"3f9f9c33.c08f44","type":"tab","label":"Flow 1"},{"id":"3f9f9c33.c08f44","type":"tab","label":"Flow 2"}]
+          volumeMounts:
+            - name: node-red-data
+              mountPath: /data
+      volumes:
+        - name: node-red-data
+          persistentVolumeClaim:
+            claimName: node-red-data
+  # Add an auto-scaling group that grows from 1-5 replicas based on CPU load
+  autoscaling:
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 80
+
+# Define the service and deployment for Appsmith
+services:
+- name: appsmith
+  selector:
+    app: appsmith
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+      protocol: TCP
+  type: ClusterIP
+deployments:
+- name: appsmith
+  replicas: 1
+  selector:
+    matchLabels:
+      app: appsmith
+  template:
+    metadata:
+      labels:
+        app: appsmith
+    spec:
+      containers:
+        - name: appsmith
+          image: appsmith/appsmith:latest
+          ports:
+            - containerPort: 3000
+  # Add an auto-scaling group that grows from 1-5 replicas based on CPU load
+  autoscaling:
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 80
