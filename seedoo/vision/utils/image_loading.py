@@ -4,7 +4,9 @@ from PIL import Image
 import io
 from typing import List, Union
 import pandas as pd
+from urllib.parse import urlparse
 import tempfile
+import boto3
 import cv2
 from io import BytesIO
 from seedoo.vision.utils.region import Region
@@ -37,6 +39,12 @@ class PathFrameLoader:
         img = img[..., ::-1].copy()
         return np.ascontiguousarray(img)
 
+import base64
+import boto3
+import numpy as np
+from PIL import Image
+import tempfile
+
 
 class ImageLoader:
     def __init__(self, path: str = '', image=None, callback=None, always_in_memory: bool = False):
@@ -61,6 +69,22 @@ class ImageLoader:
             else:
                 self.callback = lambda: image
 
+        elif self.callback is None and path.startswith('s3://'):
+            # Create a callback to download the image from S3 and return the path of the temp file
+            self.callback = lambda: ImageLoader.download_from_s3(path)
+
+    @staticmethod
+    def download_from_s3(s3_path):
+        s3 = boto3.client('s3')
+        parsed = urlparse(s3_path)
+        bucket = parsed.netloc
+        key = parsed.path[1:]
+        temp_file = tempfile.NamedTemporaryFile(delete=False)
+        s3.download_file(bucket, key, temp_file.name)
+        new_path = temp_file.name
+        image = cv2.imread(new_path)[..., ::-1]
+        return image
+
     @property
     def image(self):
         if self.__image is not None:
@@ -69,7 +93,7 @@ class ImageLoader:
             if self.callback is not None:
                 image = self.callback()
 
-            if self.path:
+            elif self.path:
                 image = cv2.imread(self.path)[..., ::-1]
             else:
                 temp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
