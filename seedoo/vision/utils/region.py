@@ -121,7 +121,7 @@ class Region:
         :param string_array:
         :return:
         """
-        return Region(new_bbox=[int(i) for i in re.findall('([0-9]+)', x)])
+        return Region(new_bbox=[int(i) for i in re.findall('([0-9]+)', string_array)])
 
     @property
     def region_props(self) -> RegionProperties:

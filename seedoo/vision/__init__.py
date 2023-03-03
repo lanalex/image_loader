@@ -6,7 +6,7 @@ def pandas():
     from pandas.core.frame import DataFrame
     def to_html_wrapper(self, perform_dispaly = True):
         from IPython.display import HTML, display
-        html = self.to_html(escape=False, index=False)
+        html = self.to_html(escape=False)
         if perform_dispaly:
             display(HTML(html))
         else:

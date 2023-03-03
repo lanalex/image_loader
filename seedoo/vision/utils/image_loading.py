@@ -7,7 +7,9 @@ import pandas as pd
 from urllib.parse import urlparse
 import tempfile
 import boto3
+import os
 import cv2
+import hashlib
 from io import BytesIO
 from seedoo.vision.utils.region import Region
 
@@ -71,19 +73,28 @@ class ImageLoader:
 
         elif self.callback is None and path.startswith('s3://'):
             # Create a callback to download the image from S3 and return the path of the temp file
-            self.callback = lambda: ImageLoader.download_from_s3(path)
+            self.callback = lambda: self.download_from_s3(path)
 
-    @staticmethod
-    def download_from_s3(s3_path):
+    def download_from_s3(self, s3_path):
         s3 = boto3.client('s3')
         parsed = urlparse(s3_path)
         bucket = parsed.netloc
         key = parsed.path[1:]
-        temp_file = tempfile.NamedTemporaryFile(delete=False)
-        s3.download_file(bucket, key, temp_file.name)
-        new_path = temp_file.name
-        image = cv2.imread(new_path)[..., ::-1]
-        return image
+        hash_str = hashlib.sha1(s3_path.encode()).hexdigest()
+        temp_dir = tempfile.gettempdir()
+        name, extension = os.path.splitext(key)
+        temp_file_path = os.path.join(temp_dir, f"imgloader_cache_{hash_str}.{extension}")
+        if not os.path.isfile(temp_file_path):
+            config = boto3.s3.transfer.TransferConfig(
+                multipart_threshold=128,
+                max_concurrency=10
+            )
+            s3.download_file(bucket, key, temp_file_path, Config=config)
+
+        self.orig_path = self.path
+        self.path = temp_file_path
+
+        return cv2.imread(temp_file_path)[..., ::-1]
 
     @property
     def image(self):
