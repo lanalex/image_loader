@@ -1,6 +1,7 @@
 #from __future__ import annotations
 from shapely.geometry import box as shapely_box
 import shapely.geometry
+import colorsys
 from shapely.geometry import Polygon
 from typing import List, Union
 import torchvision.transforms.functional as Fv
@@ -34,13 +35,16 @@ def string_convert_to_polygon(points, rotation=None):
         points[1] = int(np.floor(points[1]))
         points[2:] = [np.rint(i) for i in points[2:]]
 
-    if len(points) == 4:
+    if len(points) == 4 and not isinstance(points[0], list):
         result = box(*points)
     else:
-        columns = points[::2]
-        rows = points[1::2]
-        polygon = list(zip(columns, rows))
-        result = shapely.geometry.Polygon(polygon)
+        if isinstance(points[0], list):
+            result = shapely.geometry.Polygon(points)
+        else:
+            columns = points[::2]
+            rows = points[1::2]
+            polygon = list(zip(columns, rows))
+            result = shapely.geometry.Polygon(polygon)
 
     if rotation:
         result = affinity.rotate(result, rotation, 'center')
@@ -66,7 +70,7 @@ class Region:
         elif polygon is not None:
             polygon = string_convert_to_polygon(polygon, rotation)
             self.polygon = polygon
-            new_bbox = box(*p.bounds)
+            new_bbox = box(*self.polygon.bounds)
             self.box = new_bbox
 
         if new_bbox:
@@ -279,12 +283,39 @@ class Region:
         if len(fonts) == 1:
             fonts = fonts * len(regions)
 
+        def assign_colors(elements):
+            color_dict = {}
+            num_elements = len(elements)
+
+            for i, element in enumerate(elements):
+                # Generate a unique and easily distinguishable HSV color for each element
+                hue = i / float(num_elements)
+                saturation = 1.0
+                value = 1.0
+
+                # Convert the HSV color to BGR format
+                r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
+                color = (int(b * 255), int(g * 255), int(r * 255))
+                color_dict[element] = color
+            return color_dict
+
         offset = 0
+        unique_labels = set([])
+        for current_region, label, color, font in zip(regions, labels, colors, fonts):
+            if 'label' in current_region.meta_data:
+                label = current_region.meta_data['label']
+
+            unique_labels.add(label)
+
+        label_to_color = assign_colors(list(unique_labels))
+
         for current_region, label, color, font in zip(regions, labels, colors, fonts):
             if 'label' in current_region.meta_data:
                 label = current_region.meta_data['label']
             if 'color' in current_region.meta_data:
                 color = current_region.meta_data['color']
+            else:
+                color = label_to_color.get(label, colors[0])
 
             if not isinstance(label, dict):
                 label = {'label' : label}
