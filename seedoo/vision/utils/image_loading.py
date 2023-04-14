@@ -122,7 +122,59 @@ class ImageLoader:
 
     def __str__(self):
         base64_string = self.to_base64()
-        return f"<image src='data:image/png;base64,{base64_string}'>"
+        return f"""
+            <style>
+                .modal {{
+                    display: none;
+                    position: fixed;
+                    z-index: 1;
+                    left: 0;
+                    top: 0;
+                    width: 100%;
+                    height: 100%;
+                    overflow: auto;
+                    background-color: rgba(0,0,0,0.4);
+                }}
+                .modal-content {{
+                    background-color: #fefefe;
+                    margin: 15% auto;
+                    padding: 20px;
+                    border: 1px solid #888;
+                    width: 80%;
+                    max-width: 600px;
+                }}
+                .close {{
+                    color: #aaa;
+                    float: right;
+                    font-size: 28px;
+                    font-weight: bold;
+                }}
+                .close:hover, .close:focus {{
+                    color: black;
+                    text-decoration: none;
+                    cursor: pointer;
+                }}
+                img.thumbnail {{
+                    max-width: 150px;
+                    max-height: 150px;
+                }}
+            </style>
+            <img class="thumbnail" src='data:image/png;base64,{base64_string}' onclick='showModal()' style='cursor:pointer;'>
+            <div id='myModal' class='modal'>
+                <div class='modal-content'>
+                    <span class='close' onclick='closeModal()'>&times;</span>
+                    <img src='data:image/png;base64,{base64_string}'>
+                </div>
+            </div>
+            <script>
+                function showModal() {{
+                    document.getElementById('myModal').style.display = 'block';
+                }}
+                function closeModal() {{
+                    document.getElementById('myModal').style.display = 'none';
+                }}
+            </script>
+        """
 
     @classmethod
     def from_base64(cls, base64_str):
