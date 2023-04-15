@@ -99,7 +99,7 @@ class LazyDataFrame:
                     pickle.dump(result, f)
                     self.temp_files[cache_key] = f.name
 
-            return result
+        return result
 
     def __getattr__(self, attr: str) -> Any:
         """
