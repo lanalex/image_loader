@@ -159,7 +159,7 @@ class ImageLoader:
                     max-height: 150px;
                 }}
             </style>
-            <img class="thumbnail" src='data:image/png;base64,{base64_string}' onclick='showModal()' style='cursor:pointer;'>
+            <img class="thumbnail" src='data:image/png;base64,{base64_string}' onclick='(function(){{showModal()}})()' style='cursor:pointer;'>
             <div id='myModal' class='modal'>
                 <div class='modal-content'>
                     <span class='close' onclick='closeModal()'>&times;</span>
