@@ -57,7 +57,7 @@ class LazyDataFrame:
             if key in self.complex_columns:
                 result = []
                 indexes = []
-                for idx in range(len(self.df)):
+                for idx in self.df.index.unique():
                     func = self.df.loc[idx, key]
                     indexes.append(idx)
                     value = self.lazy_eval(func, self.df.loc[idx], idx, key)
@@ -100,6 +100,15 @@ class LazyDataFrame:
                     self.temp_files[cache_key] = f.name
 
         return result
+
+    def query(self, expr, **kwargs):
+        return LazyDataFrame(self.df.query(expr, **kwargs))
+
+    def __len__(self):
+        return len(self.df)
+
+    def sample(self, n=None, frac=None, replace=False, weights=None, random_state=None):
+        return LazyDataFrame(self.df.sample(n, frac, replace, weights, random_state))
 
     def __getattr__(self, attr: str) -> Any:
         """
