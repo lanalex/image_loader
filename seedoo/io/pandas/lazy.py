@@ -3,6 +3,7 @@ import pandas as pd
 import pickle
 import tempfile
 
+
 class LazyDataFrame:
     """
     A DataFrame-like class that lazily evaluates complex columns when accessed.
@@ -35,6 +36,10 @@ class LazyDataFrame:
         for col in self.df.columns:
             if callable(self.df[col].iloc[0]):
                 complex_columns[col] = True
+            elif isinstance(self.df[col].iloc[0], list):
+                if callable(self.df[col].iloc[0][0]):
+                    complex_columns[col] = True
+
         return complex_columns
 
     def __getitem__(self, key: Union[str, List[str]]) -> pd.DataFrame:
@@ -59,6 +64,9 @@ class LazyDataFrame:
                 indexes = []
                 for idx in self.df.index.unique():
                     func = self.df.loc[idx, key]
+
+                    if not isinstance(func, list):
+                        func = [func]
                     indexes.append(idx)
                     value = self.lazy_eval(func, self.df.loc[idx], idx, key)
                     result.append(value)
@@ -68,7 +76,7 @@ class LazyDataFrame:
 
         return pd.DataFrame(results).T
 
-    def lazy_eval(self, func: Callable, row: pd.Series, index: int, key: str) -> Any:
+    def lazy_eval(self, func_list: Callable, row: pd.Series, index: int, key: str) -> Any:
         """
         Lazily evaluates the function for the given row.
 
@@ -81,6 +89,18 @@ class LazyDataFrame:
         Returns:
             Any: The result of the function evaluation.
         """
+
+        results = []
+        for i, func in enumerate(func_list):
+            result = self.single_lazy_eval(func, row, index, f'{key}_{i}')
+            results.append(result)
+
+        if len(results) == 1:
+            return results[0]
+        else:
+            return results
+
+    def single_lazy_eval(self, func, row, index, key):
         cache_key = (func.__name__, index, key)
         if self.cache_lazy and cache_key in self.temp_files:
             if self.in_memory:

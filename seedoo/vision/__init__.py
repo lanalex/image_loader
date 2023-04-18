@@ -6,6 +6,7 @@ def pandas():
     """
     from pandas.core.frame import DataFrame
     from seedoo.io.pandas.lazy import LazyDataFrame
+    import pandas as pd
 
     def to_html_wrapper(self, perform_dispaly = True):
         from IPython.display import HTML, display
@@ -36,7 +37,7 @@ def pandas():
         return LazyDataFrame(inner_df)
 
     # Monkey-patch the DataFrame constructor
-    pd.DataFrame.__new__ = _lazy_dataframe_constructor
+    #pd.DataFrame.__new__ = _lazy_dataframe_constructor
 
 
 
