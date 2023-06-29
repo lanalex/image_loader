@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import tempfile
 import boto3
 import os
+
 import cv2
 import hashlib
 from io import BytesIO
@@ -150,6 +151,7 @@ class ImageLoader:
         return image
 
     def __str__(self):
+        # Determine the correct progress bar to use
         base64_string = self.to_base64()
         return f"<image src='data:image/png;base64,{base64_string}'>"
 
@@ -194,6 +196,17 @@ class ImageLoader:
         buffer_io = io.BytesIO(buffer)
         base64_string = base64.b64encode(buffer_io.getvalue()).decode("utf-8")
         return base64_string
+
+    def _repr_png_(self):
+        # Convert numpy array to PIL Image
+        img = Image.fromarray(self.image)
+
+        # Create byte stream and save image as PNG
+        b = BytesIO()
+        img.save(b, format='png')
+
+        # Return PNG image as bytes
+        return b.getvalue()
 
     def __getstate__(self):
         return self.path
