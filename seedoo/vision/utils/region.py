@@ -6,10 +6,16 @@ from shapely.geometry import Polygon
 from typing import List, Union
 import torchvision.transforms.functional as Fv
 import pandas as pd
+import numpy as np
 import torch.nn.functional as F
 import scipy
+from shapely import affinity
+
 import numpy as np
 from PIL import Image
+from PIL import Image, ImageDraw
+import json
+
 import skimage
 from skimage.measure._regionprops import RegionProperties
 from shapely.geometry import box
@@ -17,8 +23,26 @@ import re
 import cv2
 import torch
 from shapely import affinity
+from scipy.spatial import ConvexHull
+from itertools import combinations
+from shapely.geometry import MultiPoint
 
 
+
+def is_collinear(points):
+    for combination in combinations(points, 3):
+        x1, y1 = combination[0]
+        x2, y2 = combination[1]
+        x3, y3 = combination[2]
+
+        # Calculate the area (should be zero if the points are collinear)
+        area = 0.5 * abs(x1*(y2 - y3) + x2*(y3 - y1) + x3*(y1 - y2))
+
+        if area != 0:
+            return False
+
+    # If we haven't returned yet, then all areas were zero, so the points are collinear
+    return True
 def to_polygon(x):
     assert len(x) in [4, 8]
     if len(x) == 4:
@@ -51,14 +75,47 @@ def string_convert_to_polygon(points, rotation=None):
 
     return result
 
+class RegionStub():
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self._cached = None
+
+        #magic_methods = ['__add__', '__sub__', '__mul__', '__truediv__']  # add more if needed
+        #for method in magic_methods:
+        #    def wrapper(self, other):
+        #        print(f"Calling {method} with {other}")
+        #        original_method = getattr(other, method)
+        #        return original_method(self, other)
+
+        #    setattr(self, method, wrapper)
+
+    def __getattr__(self, name):
+        return getattr(self.instance, name)
+
+    @property
+    def instance(self):
+        r = Region(*self.args, **self.kwargs)
+        return r
+
+    def __getstate__(self):
+        return {'args' : self.args, 'kwargs' : self.kwargs}
+
+    def __setstate__(self, state):
+        self.args = state['args']
+        self.kwargs = state['kwargs']
 
 class Region:
     def __init__(self, row: int = None, column: int = None, width: int = None, height: int = None, new_bbox=None,
                  rotation=None, polygon = None,
-                 mask: np.ndarray = None, region_props: RegionProperties = None, metadata={}):
+                 mask: np.ndarray = None, region_props: RegionProperties = None, metadata={}, simplified = True):
 
+        self._inner = None
         self._children = []
-        self.polygon = None
+        self._polygon = None
+        self.simplified = False
+        self._box = None
+
         if metadata is None:
             metadata = {}
 
@@ -66,9 +123,11 @@ class Region:
         if new_bbox is not None:
             new_bbox = string_convert_to_polygon(new_bbox, rotation)
             self.box = new_bbox
-            self.polygon = self.box
+            self.polygon = new_bbox
         elif polygon is not None:
-            polygon = string_convert_to_polygon(polygon, rotation)
+            if not isinstance(polygon, shapely.geometry.Polygon):
+                polygon = string_convert_to_polygon(polygon, rotation)
+
             self.polygon = polygon
             new_bbox = box(*self.polygon.bounds)
             self.box = new_bbox
@@ -78,11 +137,12 @@ class Region:
                 self.box = box(*new_bbox)
 
             column, row, max_column, max_row = self.box.bounds
-            width = max_column - column
-            height = max_row - row
+            width = max(max_column - column, 14)
+            height = max(max_row - row, 14)
 
         if region_props is not None:
             if self.box is None:
+
                 min_row, min_column, max_row, max_column  = region_props.bbox
                 width = max_column - min_column
                 height = max_row - min_row
@@ -91,6 +151,15 @@ class Region:
                 self.width = width
                 self.height = height
                 self.box = shapely_box(self.column, self.row, self.column + width, self.row + height)
+                # get the coordinates of the pixels in the region
+                coords = region_props.coords
+
+                # Check if the coordinates span more than a point in any direction
+                if len(coords) >= 3:
+                    self.polygon = MultiPoint(coords).convex_hull
+                else:
+                    self.polygon = self.box
+
             mask = region_props.image
 
         height = int(height)
@@ -117,6 +186,100 @@ class Region:
         self.column = int(self.column)
         self.meta_data = metadata
 
+    @property
+    def polygon(self):
+        polygon = self._polygon
+        return polygon
+
+    @property
+    def box(self):
+        return self._box
+
+    @polygon.setter
+    def polygon(self, value):
+        self._polygon = value
+
+    @box.setter
+    def box(self, value):
+        self._box = value
+
+    @property
+    def xywh_bbox(self):
+        return [self.row, self.column, self.width, self.height]
+
+    def __str__(self):
+        return self.__repr__()
+
+    def __sub__(self, other: 'Region') -> float:
+        """
+        Override the subtraction operator to calculate the Euclidean distance
+        between the centers of two Region instances.
+
+        Args:
+            other (Region): The other Region instance to calculate the distance from.
+
+        Returns:
+            float: The Euclidean distance between the centers of the two Region instances.
+
+        Raises:
+            TypeError: If the 'other' parameter is not an instance of the Region class.
+        """
+        if not isinstance(other, Region):
+            raise TypeError("Unsupported operand type(s) for -: 'Region' and '{}'".format(type(other).__name__))
+
+        center_self = self.box.centroid
+        center_other = other.box.centroid
+
+        distance = np.sqrt((center_self.x - center_other.x) ** 2 + (center_self.y - center_other.y) ** 2)
+        return distance
+
+    def iou(self, other: 'Region') -> float:
+        polygon1 = self.polygon
+        polygon2 = other.polygon
+
+        if not polygon1.intersects(polygon2):  # if the polygons don't intersect return 0
+            return 0
+
+            # Calculate intersection and union areas
+        intersection_area = polygon1.intersection(polygon2).area
+        union_area = polygon1.area + polygon2.area - intersection_area
+
+        # Calculate IoU
+        iou = intersection_area / union_area
+
+        return iou
+
+    def min_intersect(self, other: 'Region') -> float:
+        polygon1 = self.polygon
+        polygon2 = other.polygon
+
+        if not polygon1.intersects(polygon2):  # if the polygons don't intersect return 0
+            return 0
+
+            # Calculate intersection and union areas
+        intersection_area = polygon1.intersection(polygon2).area
+        union_area = min(polygon1.area,polygon2.area)
+
+        # Calculate IoU
+        min_intersect = intersection_area / union_area
+
+        return min_intersect
+
+    def to_dict(self):
+        polygon = self.polygon
+
+        box = [int(i) for i in polygon.bounds]
+        result = {'row': self.row, 'column': self.column, 'width': self.width, 'height': self.height, 'metadata': self.meta_data,
+         'polygon': polygon.exterior.coords._coords.astype('float16').tolist(), 'box' : box}
+
+        del polygon
+        del box
+
+        return result
+
+    def __repr__(self):
+        return json.dumps(self.to_dict())
+
     @staticmethod
     def from_bbox_string_array(string_array):
         """
@@ -125,7 +288,55 @@ class Region:
         :param string_array:
         :return:
         """
-        return Region(new_bbox=[int(i) for i in re.findall('([0-9]+)', string_array)])
+        return RegionStub(new_bbox=[int(i) for i in re.findall('([0-9]+)', string_array)])
+
+    @staticmethod
+    def from_xyxy(x0, y0, x1, y1, metadata = {}):
+        """
+        upper left corner
+        upper top corner
+        lower right corner
+        lower bottom corner 
+        """
+        return RegionStub(y0, x0, x1 - x0, y1 - y0, metadata = metadata)
+
+
+    @staticmethod
+    def from_xywh(x0, y0, w, h, metadata = {}, offset = None):
+        """
+        upper left corner
+        upper top corner
+        lower right corner
+        lower bottom corner
+        """
+        if offset is not None:
+            x0 = offset.column + x0
+            y0 = offset.row + y0
+
+        return RegionStub(y0, x0, w, h, metadata = metadata)
+
+
+
+    @staticmethod
+    def from_quadrilateral(quadrilateral, metadata = {}, min_inflate = 0):
+        polygon = Polygon(quadrilateral)
+        current_length = np.sqrt(polygon.area)
+        if min_inflate > 0 and current_length < min_inflate:
+            # Calculate the current length of the polygon
+            # Calculate the scaling factor to achieve a length of at least 28
+            scaling_factor = float(min_inflate) / current_length
+
+            # Calculate the desired buffer width for symmetric inflation
+            buffer_width = max((scaling_factor - 1) * current_length / 2, 4)
+
+            # Inflate the polygon symmetrically
+            polygon = polygon.buffer(distance=buffer_width)
+
+        return RegionStub(polygon=polygon, metadata = metadata)
+
+    @staticmethod
+    def from_polygon(polygon, metadata = {}):
+        return RegionStub(polygon=polygon, metadata=metadata)
 
     @property
     def region_props(self) -> RegionProperties:
@@ -135,11 +346,55 @@ class Region:
         return self._region_image_properties
 
     def slice(self, img, copy: bool = False, epsilon = (0, 0, 0, 0),
-              return_pillow=False): # -> Union[np.ndarray, Image, torch.Tensor] Union[np.ndarray, Image, torch.Tensor]:
+              return_pillow=False, is_masked = True, inflate=0.0, inflate_transparency = 0.5, return_mask = False): # -> Union[np.ndarray, Image, torch.Tensor] Union[np.ndarray, Image, torch.Tensor]:
         """
         Return the slice of the img in that area the return type is the same as the input type
         epsilon: (top pad, left pad, bottom pad, right pad) -
         """
+        is_expanded = False
+        if isinstance(img, Image.Image):
+            img = np.array(img)
+
+        if len(img.shape) == 2:
+            is_expanded = True
+            img = img[..., None]
+
+        # Create a mask with the same size as the image
+        mask = Image.new('F', img.shape[0:2], 0.2)  # Use 'F' mode for a floating-point mask
+        draw = ImageDraw.Draw(mask)
+
+        # Define the original polygon
+        original_polygon = self.polygon
+
+        # Inflate the polygon if needed
+        if inflate != 0:
+            area = original_polygon.length
+            scaling_factor =   area * (1 + inflate) - area
+            inflated_polygon = original_polygon.buffer(distance = scaling_factor)
+        else:
+            inflated_polygon = original_polygon
+
+        # Draw the inflated polygon onto the mask with intensity 0.5
+        draw.polygon(list(inflated_polygon.exterior.coords), fill=inflate_transparency)
+        draw.polygon(list(original_polygon.exterior.coords), fill=1.0)
+
+        # Apply the original mask to the inflated polygon mask, making the delta darker
+        mask = np.array(mask)
+
+        if is_masked:
+            img = mask[...,None] * img
+
+        polygon = inflated_polygon
+
+        # Get the bounding rectangle coordinates (minx, miny, maxx, maxy)
+        minx, miny, maxx, maxy = polygon.bounds
+
+        # Calculate the row, column width, and height
+        row = int(miny)
+        column = int(minx)
+        width = int(maxx - minx)
+        height = int(maxy - miny)
+
         top_pad, left_pad, bottom_pad, right_pad = epsilon
         if isinstance(img, (torch.Tensor, np.ndarray)):
             if len(img.shape) > 2:
@@ -153,13 +408,21 @@ class Region:
                     else:
                         raise ValueError(f'Invalid type passed: {type(img)}, expected one of np.ndarry or torch.Tensor')
 
-                result = img[..., max(self.row - top_pad, 0):max(0, min(self.row + self.height + bottom_pad + top_pad,
+                result = img[..., max(row - top_pad, 0):max(0, min(row + height + bottom_pad + top_pad,
                                                                         img.shape[1])),
-                         max(self.column - left_pad, 0):max(0, min(self.column + self.width + right_pad + left_pad,
+                         max(column - left_pad, 0):max(0, min(column + width + right_pad + left_pad,
                                                                    img.shape[2]))]
+
+
+                mask = mask[max(row - top_pad, 0):max(0, min(row + height + bottom_pad + top_pad,
+                                                                   img.shape[1])),
+                         max(column - left_pad, 0):max(0, min(column + width + right_pad + left_pad,
+                                                              img.shape[2]))]
+
             else:
-                result = img[self.row - top_pad:self.row + self.height + bottom_pad,
-                         self.column - left_pad:self.column + self.width + right_pad]
+                result = img[row - top_pad:row + height + bottom_pad,
+                         column - left_pad:column + width + right_pad]
+
 
             if copy:
                 if isinstance(result, np.ndarray):
@@ -168,8 +431,15 @@ class Region:
                     result = result.clone()
 
             if return_pillow:
-                result = Fv.to_pil_image(torch.tensor(result))
+                result = Fv.to_pil_image(torch.tensor(np.ascontiguousarray(result.copy())))
+            else:
+                result = result.transpose(1, 2, 0)
 
+                if is_expanded:
+                    result = result[:, :]
+
+            if return_mask:
+                result = (result, mask)
             return result
 
     @staticmethod
@@ -274,6 +544,9 @@ class Region:
         """
         image = np.array(image).copy()
 
+        if image.dtype != np.uint8:
+            image = ((image / image.max()) * 255.0).astype('uint8')
+
         if not labels:
             labels = [""] * len(regions)
 
@@ -314,31 +587,32 @@ class Region:
                 label = current_region.meta_data['label']
             if 'color' in current_region.meta_data:
                 color = current_region.meta_data['color']
-            else:
+            elif len(colors) == 0:
                 color = label_to_color.get(label, colors[0])
 
             if not isinstance(label, dict):
                 label = {'label' : label}
 
-            image = cv2.rectangle(image, (current_region.column, current_region.row, current_region.width, current_region.height), color)
+            #image = cv2.rectangle(image, (current_region.row, current_region.column, current_region.height, current_region.width), color)
             offset = 0
             for k,v in label.items():
-                final_label = f"{k}: {v}"
-                label_width, label_height = cv2.getTextSize(final_label, font, 0.8, thickness)[0]
-                image = cv2.putText(image, final_label, (current_region.column + current_region.width + 10, current_region.row - 10 + offset + label_height), font, 0.8, color, thickness)
-                offset += label_height + 20
+                if v:
+                    final_label = f"{k}: {v}"
+                    label_width, label_height = cv2.getTextSize(final_label, font, 0.8, thickness)[0]
+                    image = cv2.putText(image, final_label, (current_region.column + current_region.width + 10, current_region.row - 10 + offset + label_height), font, 0.8, color, thickness)
+                    offset += label_height + 20
 
             polygon = current_region.polygon
+            exterior = [np.array(polygon.exterior.coords).round().astype(np.int32)]
+
+            # Draw the transformed polygon on the image
+            image = cv2.polylines(image, exterior, True, color, thickness)
 
             if overlay_transparency > 0:
-                exterior = [np.array(polygon.exterior.coords).round().astype(np.int32)]
                 alpha = overlay_transparency
                 overlay = image.copy()
                 cv2.fillPoly(overlay, exterior, color=color)
                 cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
-                image = cv2.polylines(image, exterior,
-                                      True, color, thickness)
-
         return image
 
 

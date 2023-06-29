@@ -1,4 +1,5 @@
 from typing import Any, Dict, Optional, Tuple, Type
+from seedoo.io.pandas.lazy import LazyDataFrame
 def pandas():
     """
     Monkey patch pandas to add render function. Similar to the tqdm.pandas() approach
@@ -8,10 +9,32 @@ def pandas():
     from seedoo.io.pandas.lazy import LazyDataFrame
     import pandas as pd
 
-    def to_html_wrapper(self, perform_dispaly = True):
+    def to_html_wrapper(self, perform_display = True, index = True):
+
         from IPython.display import HTML, display
-        html = self.to_html(escape=False)
-        if perform_dispaly:
+        columns = self.columns.values.tolist()
+        html = LazyDataFrame(self)[columns].to_html(escape=False, index = index)
+        css_style = """
+        <style>
+            div.df_container {
+                display: inline-block;
+            }
+            table.dataframe {
+                width: 100%;
+                font-size: 0.8em;
+                text-align: left;
+                border-collapse: collapse;
+                table-layout: auto;
+            }
+            table.dataframe td {
+                padding: 3px;
+            }
+        </style>
+        """
+
+        html = css_style + '<div class="df_container">' + html + '</div>'
+
+        if perform_display:
             display(HTML(html))
         else:
             return html
