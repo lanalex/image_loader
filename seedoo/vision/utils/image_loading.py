@@ -180,8 +180,12 @@ class ImageLoader:
 
         if down_scale:
             if isinstance(down_scale, (int, float)):
-                ratio = image.shape[1] / image.shape[2]
-                down_scale = (down_scale, down_scale * ratio)
+                scaling_ratio = down_scale / np.sqrt(image.shape[0] * image.shape[1])
+                if scaling_ratio > 1.5:
+                    down_scale = int(np.sqrt(image.shape[0] * image.shape[1]) * 1.5)
+
+                ratio = image.shape[0] / image.shape[1]
+                down_scale = (down_scale, int(down_scale * ratio))
 
             image = cv2.resize(image, down_scale)
 
@@ -212,6 +216,11 @@ class ImageLoader:
         return self.path
 
     def __setstate__(self, state):
+        if os.environ.get('IMAGE_LOADER_OVERRIDE_ROOT_PATH', ''):
+            new_root_path = os.environ['IMAGE_LOADER_OVERRIDE_ROOT_PATH']
+            state = os.path.basename(state)
+            state = os.path.join(new_root_path, state)
+
         self.__init__(path = state)
 
     def draw_regions(self, regions, *args, **kwargs):
