@@ -216,8 +216,8 @@ class ImageLoader:
         return self.path
 
     def __setstate__(self, state):
-        if os.environ.get('IMAGE_LOADER_OVERRIDE_ROOT_PATH', ''):
-            new_root_path = os.environ['IMAGE_LOADER_OVERRIDE_ROOT_PATH']
+        if os.environ.get('IMAGE_CACHE_DIR', ''):
+            new_root_path = os.environ['IMAGE_CACHE_DIR']
             state = os.path.basename(state)
             state = os.path.join(new_root_path, state)
 
