@@ -1,8 +1,11 @@
 import logging
 import logging.handlers
+import os
 from logging.handlers import SysLogHandler
 
-def initialize_logger(write_to_file=False):
+def initialize_logger():
+
+    write_to_file = bool(os.environ.get("SEEDOO_WRITE_LOGS_TO_FILE", "False"))
     # Get root logger
     logger = logging.getLogger()
 
