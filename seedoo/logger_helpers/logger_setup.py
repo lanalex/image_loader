@@ -35,9 +35,3 @@ def initialize_logger(write_to_file=False):
         logger.addHandler(error_file_handler)
 
     return logger
-
-# Usage with file logging
-initialize_logger(write_to_file=True)
-
-# Usage without file logging
-# initialize_logger()
