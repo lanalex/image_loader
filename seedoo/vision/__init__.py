@@ -13,7 +13,7 @@ def pandas():
 
         from IPython.display import HTML, display
         columns = self.columns.values.tolist()
-        html = LazyDataFrame(self)[columns].to_html(escape=False, index = index)
+        html = self.to_html(escape=False, index = index)
         css_style = """
         <style>
             div.df_container {
