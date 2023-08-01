@@ -346,7 +346,7 @@ class Region:
         return self._region_image_properties
 
     def slice(self, img, copy: bool = False, epsilon = (0, 0, 0, 0),
-              return_pillow=False, is_masked = True, inflate=0.0, inflate_transparency = 0.5, return_mask = False): # -> Union[np.ndarray, Image, torch.Tensor] Union[np.ndarray, Image, torch.Tensor]:
+              return_pillow=False, is_masked = False, inflate=0.0, inflate_transparency = 0.5, return_mask = False): # -> Union[np.ndarray, Image, torch.Tensor] Union[np.ndarray, Image, torch.Tensor]:
         """
         Return the slice of the img in that area the return type is the same as the input type
         epsilon: (top pad, left pad, bottom pad, right pad) -
@@ -382,7 +382,10 @@ class Region:
         mask = np.array(mask)
 
         if is_masked:
-            img = mask[...,None] * img
+            mask = mask.transpose(1,0)
+            mask = mask[..., None]
+            mask = np.repeat(mask, img.shape[2], axis=-1)
+            img = mask * img
 
         polygon = inflated_polygon
 
@@ -614,6 +617,7 @@ class Region:
                 cv2.fillPoly(overlay, exterior, color=color)
                 cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
         return image
+
 
 
 if __name__ == "__main__":

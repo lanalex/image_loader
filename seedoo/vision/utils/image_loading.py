@@ -1,4 +1,5 @@
 import base64
+import platform
 import uuid
 
 import numpy as np
@@ -15,6 +16,37 @@ import cv2
 import hashlib
 from io import BytesIO
 from seedoo.vision.utils.region import Region
+
+try:
+    import pyheif
+except ImportError:
+    if platform.system() == 'Darwin':
+        raise
+    else:
+        pass
+
+def read_heic_as_bgr(heic_path):
+    # Read the HEIC file using pyheif
+    print(heic_path)
+    heif_file = pyheif.read(heic_path)
+
+    # Convert to PIL Image
+    image = Image.frombytes(
+        heif_file.mode,
+        heif_file.size,
+        heif_file.data,
+        "raw",
+        heif_file.mode,
+        heif_file.stride,
+    )
+
+    # Convert PIL Image to a NumPy array
+    image_array = np.array(image)
+
+    # Convert from RGB to BGR format
+    image_bgr = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+
+    return image_bgr
 
 class PathFrameLoader:
     """
@@ -77,7 +109,6 @@ class ImageLoader:
                 else:
                     self.save_to_temp(image)
 
-
         elif self.callback is None and image is not None:
             if path is not None:
                 self.callback = lambda: cv2.imread(path, cv2.IMREAD_UNCHANGED)
@@ -87,10 +118,14 @@ class ImageLoader:
         elif self.callback is None and path.startswith('s3://'):
             self.callback = lambda: self.download_from_s3(path)
 
+    @classmethod
+    def from_callable(cls, callable):
+        return ImageLoader(callback=callable)
+
     def save_to_temp(self, image):
         if image.dtype == np.uint8:
             temp_file_path = os.path.join(self.caching_dir, f"imgloader_cache_{uuid.uuid4().hex}.png")
-            cv2.imwrite(temp_file_path, image[..., ::-1])
+            cv2.imwrite(temp_file_path, image[...,::-1])
         else:
             temp_file_path = os.path.join(self.caching_dir, f"imgloader_cache_{uuid.uuid4().hex}.tiff")
             cv2.imwrite(temp_file_path, image, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
@@ -123,12 +158,12 @@ class ImageLoader:
         self.orig_path = self.path
         self.path = temp_file_path
 
-        return cv2.imread(temp_file_path, cv2.IMREAD_UNCHANGED)[..., ::-1]
+        return cv2.imread(temp_file_path, cv2.IMREAD_UNCHANGED)
 
     @property
     def image(self):
         if self.__image is not None:
-            return self.__image
+            image = self.__image
         else:
             image = None
             if self.callback is not None:
@@ -139,7 +174,7 @@ class ImageLoader:
             else:
                 temp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
                 if isinstance(image, np.ndarray):
-                    cv2.imwrite(temp.name, image[..., ::-1])
+                    cv2.imwrite(temp.name, image)
                 else:
                     image.save(temp.name)
 
@@ -148,7 +183,11 @@ class ImageLoader:
         if self.always_in_memory:
             self.__image = image
 
-        return image
+        if image is None or np.min(image.shape[0:2]) < 1:
+            return image
+
+        return  cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
 
     def __str__(self):
         # Determine the correct progress bar to use
@@ -173,7 +212,6 @@ class ImageLoader:
         if image is None:
             return ''
 
-
         #encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
         if image.dtype != np.uint8:
             image = ((image / image.max()) * 255.0).astype('uint8')
@@ -194,8 +232,8 @@ class ImageLoader:
         else:
             if image.shape[0] <= 4:
                 image = np.transpose(image, [1,2,0])
-            image = image[..., ::-1]
-            _, buffer = cv2.imencode(".png", image)
+
+            _, buffer = cv2.imencode(".png", image[...,::-1])
 
         buffer_io = io.BytesIO(buffer)
         base64_string = base64.b64encode(buffer_io.getvalue()).decode("utf-8")
@@ -213,15 +251,18 @@ class ImageLoader:
         return b.getvalue()
 
     def __getstate__(self):
-        return self.path
+        return {'path' : self.path, 'callback' : self.callback}
 
     def __setstate__(self, state):
-        if os.environ.get('IMAGE_CACHE_DIR', ''):
-            new_root_path = os.environ['IMAGE_CACHE_DIR']
-            state = os.path.basename(state)
-            state = os.path.join(new_root_path, state)
+        if state['callback'] is None:
+            if os.environ.get('IMAGE_CACHE_DIR', ''):
+                new_root_path = os.environ['IMAGE_CACHE_DIR']
+                state['path'] = os.path.basename(state['path'])
+                state['path'] = os.path.join(new_root_path, state['path'])
 
-        self.__init__(path = state)
+            self.__init__(path = state['path'])
+        else:
+            self.__init__(callback = state['callback'])
 
     def draw_regions(self, regions, *args, **kwargs):
         image = self.image
@@ -232,11 +273,11 @@ class ListOfImageLoaders:
         self.list_of_image_loaders = list_of_image_loaders
         self.columns_per_row = columns_per_row
 
-    def to_df(self):
+    def to_df(self, base_64_image = True):
         row = {}
         rows = []
         for i, loader in enumerate(self.list_of_image_loaders):
-            row[str(i % self.columns_per_row)] = str(loader)
+            row[str(i % self.columns_per_row)] = str(loader) if base_64_image else loader
             if i % self.columns_per_row == 0:
                 rows.append(row)
                 if i > 0:
