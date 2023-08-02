@@ -471,47 +471,137 @@ class Region:
         iou = self.box.intersection(other_region.box).area / self.box.union(other_region.box).area
         return iou > 0.5
 
+    def highest_bbox_matches(df: pd.DataFrame, query_bbox: tuple, bbox_column: str = 'bbox', value_column = None) -> pd.DataFrame:
+        """
+        :param @bbox_column The name of the bbox column where each value format is [left, top, width, height] (can
+        be either tuple or list)
+        :param bbox_query: The query bbox in the same format as the column (left, top, width, height)
+        """
+        df = df.copy()
+
+        query_region = Region.from_xywh(*query_bbox)
+        df['region_colulmn'] = df[bbox_column].apply(lambda x: Region.from_xywh(*x))
+
+        if value_column is None:
+            df['iou'] = df['region_colulmn'].apply(lambda r: r.iou(query_region))
+        else:
+            df['iou'] = df[value_column]
+
+
+        iou_values = df.iou.values
+        threshold = max(iou_values.max() * 0.95, 0.001)
+        iou_values[iou_values <= threshold] = -1000000
+        sorted_indices = np.argsort(iou_values)[::-1]  # Sort in descending order
+        sorted_iou_values = iou_values[sorted_indices]
+
+        # Find the elbow point
+        gradient = np.gradient(sorted_iou_values)
+        second_derivative = np.gradient(gradient)
+        second_derivative = np.diff(np.sign(second_derivative))
+
+        elbow_point = np.where(second_derivative != 0)[0]
+        if len(elbow_point) == 0:
+            elbow_point = 1
+        elif elbow_point[0] == 0:
+            elbow_point = elbow_point[1] + 1
+        else:
+            elbow_point = elbow_point[0] + 1
+
+        elbow_point = max(elbow_point, 1)
+        # Select the rows corresponding to the top bounding boxes up to the elbow point
+        selected_rows = df.iloc[sorted_indices[:elbow_point]]
+        selected_rows = selected_rows.query("iou >= @threshold")
+
+        return selected_rows
+
+    def to_xywh(self):
+        return (self.column, self.row, self.width, self.height)
+
     @staticmethod
-    def group_regions_df(df: pd.DataFrame, coordinate_columns = ['xmin', 'ymin', 'xmax', 'ymax'], cluster_column_name: str= 'cluster_id', \
+    def combine_highest_scoring_bboxes(df: pd.DataFrame, bbox_column: str, score_column: str,
+                                       min_iou_threshold: float = 0.5) -> (tuple, pd.DataFrame):
+        # Sort the DataFrame by score in descending order
+        sorted_df = df.sort_values(by=score_column, ascending=False)
+        scores = sorted_df[score_column].values
+        Region.group_regions_df(sorted_df, "bbox", cluster_column_name="region_group", ma
+        # Find the elbow point using the gradient and second derivative
+        gradient = np.gradient(scores)
+        if np.abs(gradient).max() < 0.0001:
+            elbow_point = len(scores)
+        else:
+            second_derivative = np.gradient(gradient)
+            second_derivative = np.diff(np.sign(second_derivative))
+            elbow_point = np.where(second_derivative != 0)[0]
+            if len(elbow_point) == 0:
+                elbow_point = 1
+            elif elbow_point[0] == 0 and len(elbow_point) > 1:
+                elbow_point = elbow_point[1]
+            else:
+                elbow_point = elbow_point[0]
+
+            elbow_point = max(elbow_point, 1)
+
+        # Select the bounding boxes corresponding to the top scores up to the elbow point
+        selected_bboxes_df = sorted_df.iloc[:elbow_point]
+        selected_bboxes = selected_bboxes_df[bbox_column]
+
+        # Convert bounding boxes to Region objects
+        regions = selected_bboxes.apply(lambda x: Region.from_xywh(*x))
+        regions = regions.tolist()
+        filtered_indices = [0]
+
+        # Filter regions by minimum IoU threshold
+        for idx, region in enumerate(regions[1:], start=1):
+            if all(regions[i].iou(region) >= min_iou_threshold for i in filtered_indices):
+                filtered_indices.append(idx)
+
+        filtered_regions_df = selected_bboxes_df.iloc[filtered_indices]
+        filtered_regions = regions.iloc[filtered_indices]
+
+        # Combine the selected bounding boxes into a new bounding box
+        lefts, tops, widths, heights = zip(*[r.to_xywh() for r in filtered_regions])
+        new_left = min(lefts)
+        new_top = min(tops)
+        new_right = max(left + width for left, width in zip(lefts, widths))
+        new_bottom = max(top + height for top, height in zip(tops, heights))
+        new_width = new_right - new_left
+        new_height = new_bottom - new_top
+
+        combined_bbox = (new_left, new_top, new_width, new_height)
+
+        return combined_bbox, filtered_regions_df
+
+    @staticmethod
+    def group_regions_df(df: pd.DataFrame, coordinate_columns=['xmin', 'ymin', 'xmax', 'ymax'],
+                         cluster_column_name: str = 'cluster_id',
                          max_distance_in_pixels: float = 10.0) -> pd.DataFrame:
-        """
-        Group close rectangels into one, assigning them the same cluster_id
-        :param df: The dataframe
-        :param coordinate_copumns: The columns that repreesnt the coordiantes
-        :param max_distance_in_pixels: the maximum distance to consider two rectangle to be the same
-        :return: the same dataframe, with a new column
-        """
 
         if len(df) == 0:
             return df
 
         if isinstance(coordinate_columns, list):
             m = df[coordinate_columns].values
-        else:
-            """
-            In case we have a column, that each row in that column represents a list of coordinates, then 
-            the values will return a list of lists. or list of np.array
-            """
-            m = df[coordinate_columns].values
-
-            """
-            if its a list of np.ndarray, we want to create a single np.ndarray so we use hstack (horizontal sstack )
-            to stack them one on top of eache other to get one matrix of num_rows = len(df) and num_columns = m[0].shape[0]
-            """
-            if isinstance(m[0], np.ndarray):
-                m = np.hstack(m)
+        elif isinstance(coordinate_columns, str):
+            # Extract coordinates based on the type of values in the specified column
+            col_values = df[coordinate_columns].values
+            if isinstance(col_values[0], (tuple, list)):
+                # Handle tuples (left, top, width, height)
+                m = np.array([[x[0], x[1], x[0] + x[2], x[1] + x[3]] for x in col_values])
+            elif isinstance(col_values[0], Region):
+                # Handle Region objects with row, column, width, and height fields
+                m = np.array([[x.column, x.row, x.column + x.width, x.row + x.height] for x in col_values])
             else:
-                """
-                if its a list of lists, then we will acheive the same thing using np.array(m). 
-                """
-                m = np.array(m)
+                raise ValueError("Unsupported format for coordinate_columns.")
+        else:
+            raise ValueError("coordinate_columns must be a list of column names or a single column name.")
 
         m = m.astype('float')
         m = scipy.spatial.distance_matrix(m, m)
         m2 = np.zeros_like(m)
         m2[np.where(m < max_distance_in_pixels)] = 1
         np.fill_diagonal(m2, 1)
-        components, labels = scipy.sparse.csgraph.connected_components(csgraph=m2, directed=False, return_labels=True, connection='strong')
+        components, labels = scipy.sparse.csgraph.connected_components(csgraph=m2, directed=False, return_labels=True,
+                                                                       connection='strong')
         df[cluster_column_name] = labels
         return df
 
