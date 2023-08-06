@@ -10,6 +10,10 @@ import numpy as np
 import torch.nn.functional as F
 import scipy
 from shapely import affinity
+from scipy.sparse.csgraph import connected_components
+import scipy.spatial
+import numpy as np
+
 
 import numpy as np
 from PIL import Image
@@ -95,8 +99,11 @@ class RegionStub():
 
     @property
     def instance(self):
-        r = Region(*self.args, **self.kwargs)
-        return r
+        if not self._cached:
+            r = Region(*self.args, **self.kwargs)
+            self._cached = r
+
+        return self._cached
 
     def __getstate__(self):
         return {'args' : self.args, 'kwargs' : self.kwargs}
@@ -480,32 +487,34 @@ class Region:
         df = df.copy()
 
         query_region = Region.from_xywh(*query_bbox)
-        df['region_colulmn'] = df[bbox_column].apply(lambda x: Region.from_xywh(*x))
+        df['region_column'] = df[bbox_column].apply(lambda x: Region.from_xywh(*x))
 
         if value_column is None:
-            df['iou'] = df['region_colulmn'].apply(lambda r: r.iou(query_region))
+            df['iou'] = df['region_column'].apply(lambda r: r.iou(query_region))
         else:
             df['iou'] = df[value_column]
 
 
         iou_values = df.iou.values
-        threshold = max(iou_values.max() * 0.95, 0.001)
+        threshold = max(iou_values.max() * 0.4, 0.001)
         iou_values[iou_values <= threshold] = -1000000
         sorted_indices = np.argsort(iou_values)[::-1]  # Sort in descending order
         sorted_iou_values = iou_values[sorted_indices]
 
         # Find the elbow point
         gradient = np.gradient(sorted_iou_values)
-        second_derivative = np.gradient(gradient)
-        second_derivative = np.diff(np.sign(second_derivative))
 
-        elbow_point = np.where(second_derivative != 0)[0]
-        if len(elbow_point) == 0:
-            elbow_point = 1
-        elif elbow_point[0] == 0:
-            elbow_point = elbow_point[1] + 1
+        if np.max(np.abs(gradient)) <= 0.001:
+            elbow_point = len(iou_values)
         else:
-            elbow_point = elbow_point[0] + 1
+            second_derivative = np.gradient(gradient)
+            second_derivative = np.diff(np.sign(second_derivative))
+
+            elbow_point = np.where(second_derivative != 0)[0]
+            if len(elbow_point) == 0:
+                elbow_point = 1
+            else:
+                elbow_point = elbow_point[-1] + 1
 
         elbow_point = max(elbow_point, 1)
         # Select the rows corresponding to the top bounding boxes up to the elbow point
@@ -519,44 +528,19 @@ class Region:
 
     @staticmethod
     def combine_highest_scoring_bboxes(df: pd.DataFrame, bbox_column: str, score_column: str,
-                                       min_iou_threshold: float = 0.5) -> (tuple, pd.DataFrame):
+                                       max_relative_distance: float = 0.7) -> (tuple, pd.DataFrame):
         # Sort the DataFrame by score in descending order
         sorted_df = df.sort_values(by=score_column, ascending=False)
         scores = sorted_df[score_column].values
-        Region.group_regions_df(sorted_df, "bbox", cluster_column_name="region_group", ma
-        # Find the elbow point using the gradient and second derivative
-        gradient = np.gradient(scores)
-        if np.abs(gradient).max() < 0.0001:
-            elbow_point = len(scores)
-        else:
-            second_derivative = np.gradient(gradient)
-            second_derivative = np.diff(np.sign(second_derivative))
-            elbow_point = np.where(second_derivative != 0)[0]
-            if len(elbow_point) == 0:
-                elbow_point = 1
-            elif elbow_point[0] == 0 and len(elbow_point) > 1:
-                elbow_point = elbow_point[1]
-            else:
-                elbow_point = elbow_point[0]
+        original_columns = df.columns.values.tolist()
+        grouped_df = Region.group_regions_df(sorted_df, "bbox", cluster_column_name="region_group",
+                                             max_relative_distance=max_relative_distance, score_column_name=score_column)
 
-            elbow_point = max(elbow_point, 1)
+        grouped_df['region_group_score_median'] = grouped_df.groupby(['region_group'])[score_column].transform('mean')
+        grouped_df['region_column'] = grouped_df['bbox'].apply(lambda x: Region.from_xywh(*x))
+        #grouped_df = grouped_df[grouped_df['region_group_score_median'] >= grouped_df[score_column].max() * 0.7]
 
-        # Select the bounding boxes corresponding to the top scores up to the elbow point
-        selected_bboxes_df = sorted_df.iloc[:elbow_point]
-        selected_bboxes = selected_bboxes_df[bbox_column]
-
-        # Convert bounding boxes to Region objects
-        regions = selected_bboxes.apply(lambda x: Region.from_xywh(*x))
-        regions = regions.tolist()
-        filtered_indices = [0]
-
-        # Filter regions by minimum IoU threshold
-        for idx, region in enumerate(regions[1:], start=1):
-            if all(regions[i].iou(region) >= min_iou_threshold for i in filtered_indices):
-                filtered_indices.append(idx)
-
-        filtered_regions_df = selected_bboxes_df.iloc[filtered_indices]
-        filtered_regions = regions.iloc[filtered_indices]
+        filtered_regions = grouped_df.region_column.values.tolist()
 
         # Combine the selected bounding boxes into a new bounding box
         lefts, tops, widths, heights = zip(*[r.to_xywh() for r in filtered_regions])
@@ -569,40 +553,64 @@ class Region:
 
         combined_bbox = (new_left, new_top, new_width, new_height)
 
-        return combined_bbox, filtered_regions_df
+        return combined_bbox, grouped_df[original_columns]
 
     @staticmethod
     def group_regions_df(df: pd.DataFrame, coordinate_columns=['xmin', 'ymin', 'xmax', 'ymax'],
                          cluster_column_name: str = 'cluster_id',
-                         max_distance_in_pixels: float = 10.0) -> pd.DataFrame:
+                         max_relative_distance: float = 0.1, score_column_name = None, score_tolerance = 0.85) -> pd.DataFrame:
 
         if len(df) == 0:
             return df
 
+        scores = None
+        # Extract bounding box coordinates
         if isinstance(coordinate_columns, list):
             m = df[coordinate_columns].values
         elif isinstance(coordinate_columns, str):
-            # Extract coordinates based on the type of values in the specified column
             col_values = df[coordinate_columns].values
             if isinstance(col_values[0], (tuple, list)):
-                # Handle tuples (left, top, width, height)
                 m = np.array([[x[0], x[1], x[0] + x[2], x[1] + x[3]] for x in col_values])
             elif isinstance(col_values[0], Region):
-                # Handle Region objects with row, column, width, and height fields
                 m = np.array([[x.column, x.row, x.column + x.width, x.row + x.height] for x in col_values])
+
             else:
                 raise ValueError("Unsupported format for coordinate_columns.")
         else:
             raise ValueError("coordinate_columns must be a list of column names or a single column name.")
 
+        if score_column_name is not None:
+            scores = df[score_column_name].values
+
+        # Calculate the distance matrix
         m = m.astype('float')
-        m = scipy.spatial.distance_matrix(m, m)
-        m2 = np.zeros_like(m)
-        m2[np.where(m < max_distance_in_pixels)] = 1
-        np.fill_diagonal(m2, 1)
-        components, labels = scipy.sparse.csgraph.connected_components(csgraph=m2, directed=False, return_labels=True,
-                                                                       connection='strong')
+        distance_matrix = scipy.spatial.distance_matrix(m, m)
+
+        # Calculate the diagonal length for each bounding box
+        diagonals = np.sqrt((m[:, 2] - m[:, 0]) ** 2 + (m[:, 3] - m[:, 1]) ** 2)
+        max_score = None
+
+        if scores is not None:
+            max_score = np.max(scores)
+
+        # Calculate the relative distance matrix
+        relative_distance_matrix = np.zeros_like(distance_matrix)
+        for i in range(len(m)):
+            if scores is None or (scores[i] >= max_score * score_tolerance):
+                for j in range(len(m)):
+                    max_diagonal_length = max(diagonals[i], diagonals[j])
+                    relative_distance = distance_matrix[i, j] / (2 * max_diagonal_length)
+                    if relative_distance < max_relative_distance:
+                        if scores is None or scores[j] > max_score * score_tolerance:
+                            relative_distance_matrix[i, j] = 1
+
+        #np.fill_diagonal(relative_distance_matrix, 1)
+
+        # Find connected components
+        components, labels = connected_components(csgraph=relative_distance_matrix, directed=False, return_labels=True,
+                                                  connection='strong')
         df[cluster_column_name] = labels
+
         return df
 
     @staticmethod
@@ -675,7 +683,8 @@ class Region:
 
         label_to_color = assign_colors(list(unique_labels))
 
-        for current_region, label, color, font in zip(regions, labels, colors, fonts):
+        for current_region, label, current_color, font in zip(regions, labels, colors, fonts):
+            color = None
             if 'label' in current_region.meta_data:
                 label = current_region.meta_data['label']
             if 'color' in current_region.meta_data:
@@ -685,6 +694,9 @@ class Region:
 
             if not isinstance(label, dict):
                 label = {'label' : label}
+
+            if not color:
+                color = current_color
 
             #image = cv2.rectangle(image, (current_region.row, current_region.column, current_region.height, current_region.width), color)
             offset = 0
@@ -701,8 +713,13 @@ class Region:
             # Draw the transformed polygon on the image
             image = cv2.polylines(image, exterior, True, color, thickness)
 
-            if overlay_transparency > 0:
-                alpha = overlay_transparency
+            if 'overlay_transparency' in current_region.meta_data:
+                current_overlay_transparency = current_region.meta_data['overlay_transparency']
+            else:
+                current_overlay_transparency = overlay_transparency
+
+            if current_overlay_transparency > 0:
+                alpha = current_overlay_transparency
                 overlay = image.copy()
                 cv2.fillPoly(overlay, exterior, color=color)
                 cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)

@@ -1,4 +1,5 @@
 import base64
+import functools
 import platform
 import uuid
 
@@ -119,8 +120,11 @@ class ImageLoader:
             self.callback = lambda: self.download_from_s3(path)
 
     @classmethod
-    def from_callable(cls, callable):
-        return ImageLoader(callback=callable)
+    def from_callable(cls, callable, *args, **kwargs):
+        if args or kwargs:
+            return ImageLoader(callback=functools.partial(callable, *args, **kwargs))
+        else:
+            return ImageLoader(callback=callable)
 
     def save_to_temp(self, image):
         if image.dtype == np.uint8:
