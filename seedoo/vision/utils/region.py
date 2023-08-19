@@ -478,16 +478,27 @@ class Region:
         iou = self.box.intersection(other_region.box).area / self.box.union(other_region.box).area
         return iou > 0.5
 
-    def highest_bbox_matches(df: pd.DataFrame, query_bbox: tuple, bbox_column: str = 'bbox', value_column = None) -> pd.DataFrame:
+    @staticmethod
+    def highest_bbox_matches(df: pd.DataFrame, query_bbox: tuple, bbox_column: str = 'bbox', value_column = None,\
+                             bbox_list: List = None) -> pd.DataFrame:
         """
         :param @bbox_column The name of the bbox column where each value format is [left, top, width, height] (can
         be either tuple or list)
         :param bbox_query: The query bbox in the same format as the column (left, top, width, height)
         """
+        if df is not None and bbox_list is not None:
+            raise ValueError('Use either d or bbox_list not both!')
+
+        if bbox_list is not None:
+            df = pd.DataFrame([{'bbox': bbox} for bbox in bbox_list])
+
         df = df.copy()
 
         query_region = Region.from_xywh(*query_bbox)
-        df['region_column'] = df[bbox_column].apply(lambda x: Region.from_xywh(*x))
+        if not isinstance(df[bbox_column].values[0], (Region, RegionStub,)):
+            df['region_column'] = df[bbox_column].apply(lambda x: Region.from_xywh(*x))
+        else:
+            df['region_column'] = df[bbox_column]
 
         if value_column is None:
             df['iou'] = df['region_column'].apply(lambda r: r.iou(query_region))
@@ -496,7 +507,7 @@ class Region:
 
 
         iou_values = df.iou.values
-        threshold = max(iou_values.max() * 0.4, 0.001)
+        threshold = max(iou_values.max() * 0.4, 0.00000001)
         iou_values[iou_values <= threshold] = -1000000
         sorted_indices = np.argsort(iou_values)[::-1]  # Sort in descending order
         sorted_iou_values = iou_values[sorted_indices]
@@ -700,15 +711,17 @@ class Region:
 
             #image = cv2.rectangle(image, (current_region.row, current_region.column, current_region.height, current_region.width), color)
             offset = 0
-            for k,v in label.items():
-                if v:
-                    final_label = f"{k}: {v}"
-                    label_width, label_height = cv2.getTextSize(final_label, font, 0.8, thickness)[0]
-                    image = cv2.putText(image, final_label, (current_region.column + current_region.width + 10, current_region.row - 10 + offset + label_height), font, 0.8, color, thickness)
-                    offset += label_height + 20
 
             polygon = current_region.polygon
             exterior = [np.array(polygon.exterior.coords).round().astype(np.int32)]
+
+            for k,v in label.items():
+                if v:
+                    final_label = f"{v}"
+                    label_width, label_height = cv2.getTextSize(final_label, font, 0.8, thickness)[0]
+                    image = cv2.putText(image, final_label, (current_region.column + current_region.width + 10, current_region.row - 10 + offset + label_height), font, 0.3, color, thickness)
+                    offset += label_height + 20
+
 
             # Draw the transformed polygon on the image
             image = cv2.polylines(image, exterior, True, color, thickness)
@@ -724,6 +737,46 @@ class Region:
                 cv2.fillPoly(overlay, exterior, color=color)
                 cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
         return image
+
+
+
+def draw_label_inside_polygon(image, bounding_rect, label_text):
+    # Find the bounding rectangle of the polygon
+    x, y, w, h = bounding_rect
+
+    # Determine the resolution of the image
+    image_height, image_width = image.shape[:2]
+
+    # Calculate a resolution factor to take into account the image resolution
+    resolution_factor = min(image_width, image_height) / 1000.0
+
+    # Select font face and thickness
+    font_face = cv2.FONT_HERSHEY_SIMPLEX
+    font_thickness = max(int(resolution_factor), 1)
+
+    # Determine the initial font scale based on the resolution factor
+    font_scale = resolution_factor * 2
+
+    # Iterate to find the best font scale that fits within the bounding rectangle
+    while True:
+        text_size, _ = cv2.getTextSize(label_text, font_face, font_scale, font_thickness)
+        text_width, text_height = text_size
+        if text_width < w * 0.8 and text_height < h * 0.8:  # Ensure text occupies less than 80% of the bounding rectangle
+            break
+        font_scale -= 0.1 * resolution_factor
+
+    # Calculate the center of the bounding rectangle
+    center_x = x + w // 2
+    center_y = y + h // 2
+
+    # Calculate the position to start the text such that it is centered
+    start_x = center_x - text_width // 2
+    start_y = center_y + text_height // 2
+
+    # Draw the text on the image
+    cv2.putText(image, label_text, (start_x, start_y), font_face, font_scale, (0, 0, 255), font_thickness)
+
+    return image
 
 
 

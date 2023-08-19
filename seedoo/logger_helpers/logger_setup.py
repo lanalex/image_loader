@@ -90,6 +90,14 @@ def check_optimizations_and_multithreading():
         logger.critical("PyTorch does not have both optimization and multi-threading support.")
 
 
+
+class WebsocketFilter(logging.Filter):
+    def filter(self, record):
+        # Reject logs with the specific message
+        if 'websockets.server' in record.module:
+            return False
+        return True
+
 def initialize_logger():
     LOGS_DIR = os.path.expanduser("~/seedoo_logs")
 
@@ -111,6 +119,7 @@ def initialize_logger():
 
     logger.setLevel(logging.INFO) # Default level to ERROR
     logger.addHandler(syslog_handler)
+    logger.addFilter(WebsocketFilter())
 
     # If the write_to_file flag is set, add file handlers
     if write_to_file:

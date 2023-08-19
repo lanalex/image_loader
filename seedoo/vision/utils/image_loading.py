@@ -195,8 +195,8 @@ class ImageLoader:
 
     def __str__(self):
         # Determine the correct progress bar to use
-        base64_string = self.to_base64()
-        return f"<image src='data:image/png;base64,{base64_string}'>"
+        base64_string = self.to_base64(down_scale=0.6, quality_level=70)
+        return f"<image style='object-fit: cover' src='data:image/png;base64,{base64_string}'>"
 
     @classmethod
     def from_base64(cls, base64_str):
@@ -211,7 +211,7 @@ class ImageLoader:
         callback = lambda x: np.array(region.slice(image.copy(), return_pillow=True, epsilon=(10, 10, 10, 10)))
         return ImageLoader(callback=callback)
 
-    def to_base64(self, down_scale = None):
+    def to_base64(self, down_scale = None, quality_level = None):
         image = self.image
         if image is None:
             return ''
@@ -221,15 +221,13 @@ class ImageLoader:
             image = ((image / image.max()) * 255.0).astype('uint8')
 
         if down_scale:
-            if isinstance(down_scale, (int, float)):
-                scaling_ratio = down_scale / np.sqrt(image.shape[0] * image.shape[1])
-                if scaling_ratio > 1.5:
-                    down_scale = int(np.sqrt(image.shape[0] * image.shape[1]) * 1.5)
-
-                ratio = image.shape[0] / image.shape[1]
-                down_scale = (down_scale, int(down_scale * ratio))
+            if isinstance(down_scale, (float,)):
+                height, width = image.shape[0:2]
+                down_scale = (int(width * down_scale), int(height * down_scale))
 
             image = cv2.resize(image, down_scale)
+
+
 
         if len(image.shape) == 2:
             _, buffer = cv2.imencode(".jpg", image)
@@ -237,7 +235,10 @@ class ImageLoader:
             if image.shape[0] <= 4:
                 image = np.transpose(image, [1,2,0])
 
-            _, buffer = cv2.imencode(".png", image[...,::-1])
+            if quality_level:
+                ret, buffer = cv2.imencode('.jpg', image[...,::-1], [int(cv2.IMWRITE_JPEG_QUALITY), quality_level])
+            else:
+                _, buffer = cv2.imencode(".jpg", image[...,::-1])
 
         buffer_io = io.BytesIO(buffer)
         base64_string = base64.b64encode(buffer_io.getvalue()).decode("utf-8")
@@ -282,13 +283,16 @@ class ListOfImageLoaders:
         rows = []
         for i, loader in enumerate(self.list_of_image_loaders):
             row[str(i % self.columns_per_row)] = str(loader) if base_64_image else loader
-            if i % self.columns_per_row == 0:
+            if i % self.columns_per_row == 0 and i > 0:
                 rows.append(row)
                 if i > 0:
                     row = {}
 
-        df = pd.DataFrame(rows)
-        return df
+        if row:
+            rows.append(row)
+
+        df = pd.DataFrame(rows, index = np.arange(0, len(rows), 1))
+        return df.fillna('Empty')
 
     def __str__(self):
         df = self.to_df()
