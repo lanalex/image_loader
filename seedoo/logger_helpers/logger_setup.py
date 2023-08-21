@@ -126,12 +126,12 @@ def initialize_logger():
         if not os.path.exists(LOGS_DIR):
             os.mkdir(LOGS_DIR)
 
-        log_file = os.path.join(LOGS_DIR, "seedoo.log")
+        log_file = os.path.join(LOGS_DIR, f"seedoo_{os.getpid()}.log")
         file_handler = logging.handlers.RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
-        error_log_file = os.path.join(LOGS_DIR, "seedoo_error.log")
+        error_log_file = os.path.join(LOGS_DIR, f"seedoo_error_{os.getpid()}.log")
         error_file_handler = logging.handlers.RotatingFileHandler(error_log_file, maxBytes=10*1024*1024, backupCount=5)
         error_file_handler.setLevel(logging.ERROR)
         error_file_handler.setFormatter(formatter)
