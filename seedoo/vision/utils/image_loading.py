@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import tempfile
 import boto3
 import os
+import urllib
 
 import cv2
 import hashlib
@@ -118,6 +119,14 @@ class ImageLoader:
 
         elif self.callback is None and path.startswith('s3://'):
             self.callback = lambda: self.download_from_s3(path)
+        elif self.callback is None and path.startswith('http://'):
+            self.callback = lambda: self.download_from_url(path)
+
+    def download_image_from_url(self, url):
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as f:
+            image = Image.open(f).convert("RGB")
+        return np.array(image)[...,[2,1,0]]
 
     @classmethod
     def from_callable(cls, callable, *args, **kwargs):
