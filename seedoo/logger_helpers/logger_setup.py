@@ -97,11 +97,25 @@ class WebsocketFilter(logging.Filter):
         if 'websockets.server' in record.module:
             return False
         return True
+class ExceptionFilter(logging.Filter):
+    def filter(self, record):
+        return record.exc_info is not None
+
+
+class ExceptionMessageHandler(logging.StreamHandler):
+    def emit(self, record):
+        if record.exc_info:
+            etype, evalue, etb = record.exc_info
+            record.msg = str(evalue)
+            record.exc_info = None
+        super(ExceptionMessageHandler, self).emit(record)
 
 def initialize_logger():
     LOGS_DIR = os.path.expanduser("~/seedoo_logs")
-
     write_to_file = bool(os.environ.get("SEEDOO_WRITE_LOGS_TO_FILE", "True"))
+    log_level_str = os.environ.get("SEEDOO_LOG_LEVEL", "INFO")
+    log_level = getattr(logging, log_level_str.upper(), logging.INFO)
+
     # Get root logger
     logger = logging.getLogger()
 
@@ -117,9 +131,20 @@ def initialize_logger():
     syslog_handler = SysLogHandler(address=syslog_address, facility=SysLogHandler.LOG_LOCAL0)
     syslog_handler.setFormatter(formatter)
 
-    logger.setLevel(logging.INFO) # Default level to ERROR
+    logger.setLevel(log_level)
     logger.addHandler(syslog_handler)
-    logger.addFilter(WebsocketFilter())
+
+    # Exception Handler for stdout - only exception messages, no stack trace
+    exception_handler_stdout = ExceptionMessageHandler(sys.stdout)
+    exception_handler_stdout.setLevel(logging.ERROR)
+    exception_handler_stdout.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(exception_handler_stdout)
+
+    # Exception Handler for stderr - only exception messages, no stack trace
+    exception_handler_stderr = ExceptionMessageHandler(sys.stderr)
+    exception_handler_stderr.setLevel(logging.ERROR)
+    exception_handler_stderr.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(exception_handler_stderr)
 
     # If the write_to_file flag is set, add file handlers
     if write_to_file:
@@ -131,12 +156,14 @@ def initialize_logger():
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
-        error_log_file = os.path.join(LOGS_DIR, f"seedoo_error_{os.getpid()}.log")
-        error_file_handler = logging.handlers.RotatingFileHandler(error_log_file, maxBytes=10*1024*1024, backupCount=5)
-        error_file_handler.setLevel(logging.ERROR)
-        error_file_handler.setFormatter(formatter)
-        logger.addHandler(error_file_handler)
+        exception_log_file = os.path.join(LOGS_DIR, f"seedoo_exception_{os.getpid()}.log")
+        exception_file_handler = logging.handlers.RotatingFileHandler(exception_log_file, maxBytes=10*1024*1024, backupCount=5)
+        exception_file_handler.setLevel(logging.ERROR)
+        exception_file_handler.setFormatter(formatter)
+        exception_file_handler.addFilter(ExceptionFilter())
+        logger.addHandler(exception_file_handler)
 
     return logger
+
 
 check_optimizations_and_multithreading()
