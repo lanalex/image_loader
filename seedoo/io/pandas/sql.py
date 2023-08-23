@@ -1,4 +1,6 @@
+import seedoo.logger_helpers.logger_setup
 import ast
+import logging
 import sqlite3
 import pandas as pd
 import os
@@ -11,6 +13,101 @@ import threading
 import tqdm
 import ast
 from concurrent.futures import ThreadPoolExecutor
+
+# Store a reference to the original `sqlite3.connect`.
+_original_sqlite3_connect = sqlite3.connect
+
+def set_pragmas_for_conn(conn):
+    """Set optimized pragmas for a sqlite3 connection."""
+
+    cur = conn.cursor()
+    cur.execute("PRAGMA page_size;")
+    page_size = cur.fetchone()[0]
+    cur.close()
+
+    desired_cache_size_bytes = 500 * 1024 ** 2
+
+    # Calculate the number of pages required for the desired cache size
+    num_pages = desired_cache_size_bytes // page_size
+
+    # Set the cache size
+    conn.execute(f"PRAGMA cache_size={num_pages};")
+
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA cache_size=-131072;")
+    conn.execute("PRAGMA mmap_size=2147483648;")
+
+def optimized_sqlite3_connect(*args, **kwargs):
+    """Wrapper around sqlite3.connect that sets optimized pragmas."""
+    conn = _original_sqlite3_connect(*args, **kwargs)
+    set_pragmas_for_conn(conn)
+    return conn
+
+# Monkey-patch sqlite3.connect with our optimized version.
+sqlite3.connect = optimized_sqlite3_connect
+
+original_to_sql = pd.DataFrame.to_sql
+
+
+def custom_to_sql(
+    df,
+    name: str,
+    con,
+    schema=None,
+    if_exists: str = "fail",
+    index: bool = True,
+    index_label=None,
+    chunksize=None,
+    dtype=None,
+    method=None,
+) -> None:
+    """
+    Custom to_sql function to improve SQLite writing performance.
+    """
+
+    # If 'replace', use original pandas to_sql for the first few rows to set up table schema
+    if if_exists == 'replace':
+
+        if len(df.columns.values) <= 2:
+            original_to_sql(df, name, con, if_exists=if_exists, index=index, index_label=index_label,
+                            dtype=dtype)
+            return
+        else:
+            original_to_sql(df.iloc[:5], name, con, if_exists=if_exists, index=index, index_label=index_label,
+                            dtype=dtype)
+            df = df.iloc[5:]
+            index = False
+            if_exists = 'append'  # Switch to 'append' mode for the remaining rows
+
+    # Create a connection and cursor
+    if if_exists == 'append':
+        with con:
+            cur = con.cursor()
+
+            # Calculate chunk size, if not provided
+            chunksize = chunksize or 1000
+
+            for start in range(0, len(df), chunksize):
+                end = start + chunksize
+                batch = df.iloc[start:end]
+                # Extract column names from the DataFrame
+                column_names = ", ".join([f'{col}' for col in batch.columns])
+
+                # Prepare the placeholders
+                num_columns = len(batch.columns)
+                placeholders = ", ".join(["?"] * num_columns)
+
+                data = [tuple([row[col_name] for col_name in batch.columns.values]) for _, row in batch.iterrows()]
+
+                # Execute the in sert with explicit column names
+                cur.executemany(f"INSERT INTO {name} ({column_names}) VALUES ({placeholders})", data)
+
+                con.commit()
+
+# Monkey patch pandas DataFrame's to_sql with our custom version
+pd.DataFrame.to_sql = custom_to_sql
+
 
 def pandas_query_to_sqlite(query_str):
     # Access calling frame's local and global variables
@@ -103,62 +200,119 @@ class DataFrameGroupByWrapper:
         return pd.concat(results, axis=0)
 
 
-class SQLDataFrameWrapper:
+def optimize_sqlite(db_name, desired_cache_size_gb=6):
+    # Convert desired cache size from GB to bytes
+    desired_cache_size_bytes = desired_cache_size_gb * 1024 ** 3
 
+    # Connect to the SQLite database
+    with sqlite3.connect(db_name) as conn:
+        cur = conn.cursor()
+
+        # Get the page size
+        cur.execute("PRAGMA page_size;")
+        page_size = cur.fetchone()[0]
+
+        # Calculate the number of pages required for the desired cache size
+        num_pages = desired_cache_size_bytes // page_size
+
+        # Set the cache size
+        cur.execute(f"PRAGMA cache_size={num_pages};")
+
+        # Set other performance enhancing pragmas
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA synchronous=NORMAL;")
+
+        # Set memory-mapped I/O size
+        mmap_size = desired_cache_size_bytes  # Setting it to the same size as the cache for simplicity
+        cur.execute(f"PRAGMA mmap_size={mmap_size};")
+
+        # Commit changes and close the connection
+        conn.commit()
+
+
+
+class SQLDataFrameWrapper:
     class LocIndexer:
         def __init__(self, wrapper):
             self.wrapper = wrapper
 
         def __getitem__(self, idx):
+            # If idx is a slice, it's equivalent to df.loc[start:stop]
+            if isinstance(idx, slice):
+                # Handle the case where the stop value in the slice might be None.
+                # If it's None, then we'll need a default value.
+                # A typical default could be the length of the DataFrame, but it depends on your context.
+                default_stop = len(self.wrapper.chunk_files)  # Assuming this gives the length of the DataFrame
+                start, stop, step = idx.start, idx.stop, idx.step
+
+                # Create an array of indices based on the slice's start, stop, and step
+                row_idx = np.arange(start, stop, step).tolist()
+                return self.wrapper._loc_method(row_idx, None)
+
             # Handle single label, list of labels, or tuple with (row_labels, col_labels)
-            if isinstance(idx, tuple):
+            elif isinstance(idx, tuple):
                 row_labels, col_labels = idx
+                if isinstance(row_labels, slice):
+                    # Ensure the slice start and stop are valid labels in the DataFrame
+                    # This check can be expanded further based on your specific implementation
+                    assert row_labels.start in self.wrapper.chunking_index and row_labels.stop in self.wrapper.chunking_index
+                return self.wrapper._loc_method(row_labels, col_labels)
             else:
                 row_labels = idx
                 col_labels = None
-
-            return self.wrapper._loc_method(row_labels, col_labels)
-
+                return self.wrapper._loc_method(row_labels, col_labels)
 
     class IlocIndexer:
         def __init__(self, wrapper):
             self.wrapper = wrapper
 
         def __getitem__(self, idx):
-            # Handle single integer, slice, or tuple with (row_idx, col_idx)
-            if isinstance(idx, tuple):
+            # If idx is a slice, it's equivalent to df.iloc[start:stop]
+            if isinstance(idx, slice):
+                # Handle the case where the stop value in the slice might be None.
+                # If it's None, then we'll need a default value.
+                # A typical default could be the length of the DataFrame, but it depends on your context.
+                default_stop = len(self.wrapper.chunk_files)  # Assuming this gives the length of the DataFrame
+                start, stop, step = idx.start, idx.stop, idx.step
+
+                # Create an array of indices based on the slice's start, stop, and step
+                row_idx = np.arange(start, stop, step).tolist()
+                return self.wrapper._iloc_method(row_idx, None)
+
+            # Handle single integer, list of integers, or tuple with (row_idx, col_idx)
+            elif isinstance(idx, tuple):
                 row_idx, col_idx = idx
+                # Ensuring the slice start and stop are valid integer indices can be done in _iloc_method
+                # Here, we simply pass them along
+                return self.wrapper._iloc_method(row_idx, col_idx)
+
             else:
                 row_idx = idx
                 col_idx = None
+                return self.wrapper._iloc_method(row_idx, col_idx)
 
-            return self.wrapper._iloc_method(row_idx, col_idx)
-
-    def __init__(self, df=None, db_name="database.db", append=False, path = os.getcwd()):
+    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 10000):
         self.db_name = os.path.join(path, db_name)
         self.complex_columns = []
         self._chunk_cache = {}
         self.path = path
+        self.chunk_size = chunk_size
         self._iloc_indexer = SQLDataFrameWrapper.IlocIndexer(self)
+        self.append_lock = threading.Lock()
         self._loc_indexer = SQLDataFrameWrapper.LocIndexer(self)
         self.thread_executor = ThreadPoolExecutor(8)  # Initializes a thread pool executor
         self.special_types = {}
+        self.logger = logging.getLogger(__name__)
+        optimize_sqlite(db_name)
 
 
         if df is not None:
             # If append mode, fetch the max chunking_index from the DB and adjust the new df's chunking_index accordingly
-            if append:
-                with sqlite3.connect(self.db_name) as conn:
-                    max_index = conn.execute("SELECT MAX(chunking_index) FROM data").fetchone()[0]
-                if max_index is None:  # In case the table is empty
-                    max_index = -1
-                df['chunking_index'] = np.arange(max_index + 1, max_index + len(df) + 1, 1).astype(np.int32)
-            else:
-                df['chunking_index'] = np.arange(0, len(df), 1).astype(np.int32)
+            df['chunking_index'] = df.core_index.values.astype(np.int32)
 
             self._simple_columns, self.complex_columns, special_types = SQLDataFrameWrapper.identify_column_types(df)
             self.special_types.update(special_types)
-            self._store_data(df, append)
+            self._store_data(df, append = False)
 
 
     def _loc_method(self, row_labels, col_labels=None):
@@ -169,7 +323,7 @@ class SQLDataFrameWrapper:
 
         # Insert row_labels into a temp table
         with sqlite3.connect(self.db_name) as conn:
-            temp_df.to_sql("temp_table", conn, if_exists="replace", index=False)
+            temp_df.to_sql("temp_table", conn, if_exists="replace", index=False, method='multi')
 
             # Join the temp table with the main data table on chunking_index
             query = """
@@ -183,7 +337,14 @@ class SQLDataFrameWrapper:
         if col_labels:
             subset_df = subset_df[col_labels]
 
+        subset_df = self._restore_types(subset_df)
+
+        subset_df = self.fetch_all_for_df(subset_df)
         return subset_df
+
+    @property
+    def columns(self):
+        return pd.Series(list(self.complex_columns + self.simple_columns))
 
     @staticmethod
     def identify_column_types(df):
@@ -255,30 +416,45 @@ class SQLDataFrameWrapper:
         provided_simple_cols, provided_complex_cols, special_types = self.identify_column_types(df)
 
         # Step 2: Identify new columns compared to existing data
-        new_columns = [col for col in provided_simple_cols if col not in self.simple_columns]
+        columns_to_use = list(set(self.simple_columns) - (set(provided_simple_cols) - set(['chunking_index'])))
+        columns_to_use = ", ".join([f"a.{col} as {col}" for col in columns_to_use])
+        columns_to_add_or_update = ", ".join([f"b.{col} as {col}" for col in provided_simple_cols if col != 'chunking_index'])
 
         with sqlite3.connect(self.db_name) as conn:
             # Step 3: Insert the new DataFrame into a temporary table
-            df[new_columns + ['chunking_index']].to_sql('temp_new_data', conn, if_exists='replace', index=False)
+            self.logger.info(f'Inserting df of length {len(df)} into temp table for update')
+            df[provided_simple_cols].to_sql('temp_new_data', conn, if_exists='replace', index=False, method='multi')
+
+            # Step 6: Re-add indices to the new data table
+            for col in provided_simple_cols:
+                if col != 'index':
+                    try:
+                        conn.execute(f"CREATE INDEX idx_{col} ON temp_new_data ({col})")
+                    except sqlite3.OperationalError as exc:
+                        if "already exists" in exc.args[0]:
+                            pass
+                        else:
+                            raise
+
 
             # Step 4: Join the temp table with the main data table
-            conn.execute("""
+            conn.execute(f"""
                 CREATE TABLE temp_combined_data AS
-                SELECT a.*, b.*
+                SELECT {columns_to_use},{columns_to_add_or_update}
                 FROM data AS a
                 RIGHT JOIN temp_new_data AS b
                 ON a.chunking_index = b.chunking_index
             """)
 
             # Step 5: Swap tables
+            self.logger.info('Dropping data and renaming the temp table')
+
             conn.execute("DROP TABLE data")
             conn.execute("ALTER TABLE temp_combined_data RENAME TO data")
 
-            # Step 6: Re-add indices to the new data table
-            for col in provided_simple_cols:
-                if col != 'index':
-                    conn.execute(f"CREATE INDEX idx_{col} ON data({col})")
+            self.logger.info('Creating indexes')
         if provided_complex_cols:
+            self.logger.info('Handling complex columns')
             self.update_chunked_dataframes(df[provided_complex_cols + ["chunking_index"]])
 
 
@@ -323,7 +499,8 @@ class SQLDataFrameWrapper:
         with tqdm.tqdm(total=len(self.chunk_files), desc='Updating chunk files') as pbar:
             for i, chunk_file in enumerate(self.chunk_files):
                 # Load the chunk using read_pickle with compression
-                chunk_df = pd.read_pickle(chunk_file, compression='gzip')
+                pbar.update(1)
+                chunk_df = self.fetch_raw_chunk(chunk_file = chunk_file)
 
                 # Update the chunk using merge on the 'chunking_index'
                 updated_chunk = pd.merge(chunk_df, df, on="chunking_index", how="inner", suffixes=['_old', ''])
@@ -336,18 +513,13 @@ class SQLDataFrameWrapper:
                 # Save the updated chunk back using to_pickle with compression
                 updated_chunk.to_pickle(chunk_file, compression='gzip')
 
-                pbar.update(1)
 
     def chunked_dataframes(self):
         """ Generator to produce dataframes from the stored chunks."""
         with tqdm.tqdm(total = len(self.chunk_files), desc = 'Reading chunk files') as pbar:
             for i, chunk_file in enumerate(self.chunk_files):
-                if i not in self._chunk_cache:
-                    df_chunk = self._fetch_chunk(i)
-                    self._chunk_cache[i] = df_chunk
-                else:
-                    df_chunk = self._chunk_cache[i]
-
+                chunk = self.fetch_raw_chunk(None, chunk_file=chunk_file)
+                df_chunk = self._fetch_chunk(i, chunk)
                 pbar.update(1)
                 yield df_chunk
 
@@ -359,6 +531,7 @@ class SQLDataFrameWrapper:
         self._chunk_cache = {}
         self._loc_indexer = SQLDataFrameWrapper.LocIndexer(self)
         self.append_lock = threading.Lock()
+        self.logger = logging.getLogger(__name__)
         self.chunk_size = state['chunk_size']
         self._iloc_indexer = SQLDataFrameWrapper.IlocIndexer(self)
 
@@ -367,46 +540,38 @@ class SQLDataFrameWrapper:
         self.special_types.update(special_types)
         simple_columns_df = df.drop(columns=complex_columns)
 
-        # Save simple columns to SQLite
-        with sqlite3.connect(self.db_name) as conn:
-            if append:
-                simple_columns_df.to_sql("data", conn, index=True, if_exists="append")
-            else:
-                simple_columns_df.to_sql("data", conn, index=True, if_exists="replace")
-                for col in self.simple_columns + ["chunking_index"]:
-                    try:
-                        conn.execute(f"CREATE INDEX idx_{col} ON data ({col})")
-                    except sqlite3.OperationalError as exc:
-                        if "already exists" in exc.args[0]:
-                            pass
-                        else:
-                            raise
+        with self.append_lock:
+            # Save simple columns to SQLite
+            with sqlite3.connect(self.db_name) as conn:
+                if append:
+                    simple_columns_df = simple_columns_df[self.simple_columns]
+                    simple_columns_df.to_sql("data", conn, index=True, if_exists="append")
+                else:
+                    simple_columns_df.to_sql("data", conn, index=True, if_exists="replace")
+                    for col in self.simple_columns + ["chunking_index"]:
+                        try:
+                            conn.execute(f"CREATE INDEX idx_{col} ON data ({col})")
+                        except sqlite3.OperationalError as exc:
+                            if "already exists" in exc.args[0]:
+                                pass
+                            else:
+                                raise
 
-        # Save complex columns to pickled files
+        num_chunks = max(1, len(df) // self.chunk_size)
+        for i, chunk in enumerate(np.array_split(df[complex_columns+ ["chunking_index"]].sort_values(by=['chunking_index']),
+                                                 num_chunks)):
+            chunk_id = int(chunk.chunking_index.max() // self.chunk_size)
+            filename = f"{os.path.join(self.path, 'chunks')}/chunk_{chunk_id}.pkl"
+            new_chunk = chunk[complex_columns + ["chunking_index"]]
+            if os.path.exists(filename):
+                existing_chunk = self.fetch_raw_chunk(chunk_file=filename)
+                if append:
+                    new_chunk = pd.concat([existing_chunk, new_chunk])
 
-        if not append:
-            self.chunk_size = max(1, len(df) // 1)  # Adjust the chunking by modifying the denominator
+                #if not append:
+                #    raise RuntimeError(f'Trying to append a chunk to an already existing one! {filename}')
 
-        os.makedirs(os.path.join(self.path, "chunks"), exist_ok=True)
-        chunk_ids = []
-
-        if append:
-            for name in os.listdir(os.path.join(self.path, "chunks")):
-                chunk_ids.append(int(name.split("_")[1].split(".")[0]))
-
-            existing_chunks = len(
-                [name for name in os.listdir(os.path.join(self.path, "chunks")) if os.path.isfile(os.path.join("chunks", name))])
-        else:
-            existing_chunks = 0
-
-        if append:
-            filename = f"{os.path.join(self.path, 'chunks')}/chunk_{max(chunk_ids) + 1}.pkl"
-            df[complex_columns + ["chunking_index"]].to_pickle(filename, compression = 'gzip')
-        else:
-            for i, chunk in enumerate(np.array_split(df[complex_columns+ ["chunking_index"]].sort_values(by=['chunking_index']),
-                                                     len(df) // self.chunk_size)):
-                filename = f"{os.path.join(self.path, 'chunks')}/chunk_{existing_chunks + i}.pkl"
-                chunk[complex_columns + ["chunking_index"]].to_pickle(filename, compression='gzip')
+            new_chunk.to_pickle(filename, compression='gzip')
 
     @property
     def chunk_files(self):
@@ -448,27 +613,30 @@ class SQLDataFrameWrapper:
         self._sync_append(df)
 
     def _sync_append(self, df):
-        with sqlite3.connect(self.db_name) as conn:
-            max_index = conn.execute("SELECT MAX(chunking_index) FROM data").fetchone()[0]
-        if max_index is None:  # In case the table is empty
-            max_index = -1
-        df['chunking_index'] = np.arange(max_index + 1, max_index + len(df) + 1, 1).astype(np.int32)
-        self._store_data(df, append=True)
+        try:
+            df['chunking_index'] = df.core_index.values.astype(np.int32)
+            self._store_data(df, append=True)
+        except Exception as exc:
+            self.logger.exception('Error in write append')
+            raise
 
-    def _fetch_chunk(self, chunk_idx):
-        df_complex = pd.read_pickle(self.chunk_files[chunk_idx], compression = 'gzip')
+    def _fetch_chunk(self, chunk_idx, df_complex = None):
+
+        if df_complex is None:
+            df_complex = self.fetch_raw_chunk(int(chunk_idx))
 
         with sqlite3.connect(self.db_name) as conn:
             # Step 1 & 2: Create a temporary table and insert chunking indices
+            df_complex['chunking_index'] = df_complex['chunking_index'].astype(np.int32)
             df_complex[['chunking_index']].to_sql('tmp_chunking_indices', conn, if_exists='replace', index=False)
 
             # Step 3: Perform a join to fetch the relevant rows
             query = """
             SELECT data.*
             FROM data
-            JOIN tmp_chunking_indices ON data.chunking_index = tmp_chunking_indices.chunking_index
+            INNER JOIN tmp_chunking_indices ON data.chunking_index = tmp_chunking_indices.chunking_index
             """
-            df_simple = pd.read_sql_query(query, conn)
+            df_simple = pd.read_sql(query, conn)
             df_simple = self._restore_types(df_simple)
 
             # Step 4: Drop the temporary table
@@ -522,7 +690,7 @@ class SQLDataFrameWrapper:
         cached_chunk = None  # To store the currently loaded chunk
 
         for index, row in sorted_simple_df.iterrows():
-            chunk_idx = min(row['chunking_index'] // len(self.chunk_files), len(self.chunk_files) - 1)
+            chunk_idx = max(int(row['chunking_index'] // self.chunk_size) - 1, 0)
 
             # If current row's chunk isn't cached, load and update cache
             if chunk_idx != cached_chunk_idx:
@@ -534,21 +702,20 @@ class SQLDataFrameWrapper:
             required_rows.append(matched_df)
 
         result_df = pd.concat(required_rows).drop_duplicates(subset=['chunking_index'])
+        result_df = result_df.merge(simple_df[self.simple_columns], on = ['chunking_index'])
         return result_df
 
     @property
     def index(self):
         with sqlite3.connect(self.db_name) as conn:
-            result = conn.execute("SELECT chunking_index FROM data order by chunking_index asc").fetchall()
+            result = conn.execute("SELECT distinct chunking_index FROM data order by chunking_index asc").fetchall()
+        result = [i[0] for i in result]
         return pd.Series(list(result))
 
     def _update_chunk(self, df_chunk):
         # Determine the chunk file based on the 'chunking_index' of the dataframe
-        chunk_indices = df_chunk["chunking_index"].unique()
-        chunk_idx = [i // self.chunk_size for i in chunk_indices]
-        if len(set(chunk_idx)) > 1:
-            raise ValueError("The dataframe spans multiple chunks. It should belong to only one chunk.")
-        chunk_idx = chunk_idx[0]
+        chunk_indices = df_chunk["chunking_index"].max()
+        chunk_idx = max(int(chunk_indices // self.chunk_size) - 1, 0)
 
         simple_columns, complex_columns, special_types = SQLDataFrameWrapper.identify_column_types(df_chunk)
         # Split the columns into simple and complex
@@ -561,11 +728,12 @@ class SQLDataFrameWrapper:
             existing_column_names = [col[1] for col in existing_columns]
 
             first = True
+            update_cols = [col for col in simple_columns_df.columns if col in existing_column_names]
+            insert_cols = [col for col in simple_columns_df.columns if col not in existing_column_names]
+
             # Update or Add the simple columns in the SQLite DB
             for _, row in simple_columns_df.iterrows():
                 # Determine columns that are being updated vs columns that are being added
-                update_cols = [col for col in simple_columns_df.columns if col in existing_column_names]
-                insert_cols = [col for col in simple_columns_df.columns if col not in existing_column_names]
 
                 if update_cols:
                     cols_str = ', '.join([f'"{col}" = ?' for col in update_cols])
@@ -582,10 +750,11 @@ class SQLDataFrameWrapper:
 
                         # And then insert the data into these new columns
                         query = f'UPDATE data SET "{col}" = ? WHERE chunking_index = ?'
-                        values = [row[col], row.name]
+                        values = [row[col], row.chunking_index]
                         conn.execute(query, values)
 
         # Update the complex columns in the pickle chunk
+        self._chunk_cache[self.chunk_files[chunk_idx]] = complex_columns_df
         complex_columns_df.to_pickle(self.chunk_files[chunk_idx], compression = 'gzip')
 
 
@@ -596,7 +765,14 @@ class SQLDataFrameWrapper:
                 continue
             df_chunk[key] = value if isinstance(value, (int, float, str)) else value[
                                                                                df_chunk.index.min():df_chunk.index.max() + 1]
+
             self._update_chunk(df_chunk)
+
+    def __len__(self):
+        with sqlite3.connect(self.db_name) as conn:
+            result = conn.execute("SELECT count(*) FROM data").fetchone()[0]
+
+        return result
 
     @property
     def simple_columns(self):
@@ -626,6 +802,18 @@ class SQLDataFrameWrapper:
                 return pd.concat(all_rows)
 
 
+    def fetch_raw_chunk(self, chunk_index = None, chunk_file = None):
+        if chunk_file is None:
+            if chunk_index >= len(self.chunk_files):
+                print(f'BAD CHUNK: {chunk_index} and chunk_files is: {self.chunk_files}')
+            chunk_file = self.chunk_files[int(chunk_index)]
+
+        #if chunk_file not in self._chunk_cache:
+        cached_chunk = pd.read_pickle(chunk_file, compression='gzip')
+        self._chunk_cache[chunk_file] = cached_chunk
+
+        return self._chunk_cache[chunk_file]
+
     def query(self, query_str):
         query_str = pandas_query_to_sqlite(query_str)
 
@@ -633,6 +821,7 @@ class SQLDataFrameWrapper:
         with sqlite3.connect(self.db_name) as conn:
             queried_df = pd.read_sql_query(f"SELECT * FROM data WHERE {query_str}", conn)
 
+        queried_df = self._restore_types(queried_df)
         # Sort queried DataFrame by chunking_index for efficient chunk retrieval
         queried_df = queried_df.sort_values(by="chunking_index")
 
@@ -640,25 +829,39 @@ class SQLDataFrameWrapper:
         required_rows = []
         cached_chunk_idx = -1  # Initialize with a non-existent chunk index
         cached_chunk = None  # To store the currently loaded chunk
+        indexes = [max(int(i // self.chunk_size) - 1, 0) for i in queried_df.chunking_index.unique()]
 
-        for index, row in queried_df.iterrows():
-            chunk_idx = min(row['index'] // self.chunk_size, len(self.chunk_files) - 1)
+        with tqdm.tqdm(desc = 'fetching full chunks to merge with query') as pbar:
+            for chunk_idx in indexes:
+                # If current row's chunk isn't cached, load and update cache
+                if chunk_idx != cached_chunk_idx:
+                    cached_chunk = self.fetch_raw_chunk(int(chunk_idx))
+                    cached_chunk_idx = chunk_idx
 
-            # If current row's chunk isn't cached, load and update cache
-            if chunk_idx != cached_chunk_idx:
-                cached_chunk = pd.read_pickle(self.chunk_files[chunk_idx], compression='gzip')
-                cached_chunk_idx = chunk_idx
+                # Use cached_chunk to extract the necessary rows
+                required_rows.append(cached_chunk)
+                pbar.update(1)
 
-            # Use cached_chunk to extract the necessary rows
-            matched_df = cached_chunk[cached_chunk["chunking_index"] == row['chunking_index']]
-            required_rows.append(matched_df)
 
-        result_df = pd.concat(required_rows).drop_duplicates(subset=['chunking_index'])
+        if len(required_rows) ==  0:
+            result_df = self.iloc[0:1].head(0)
+        else:
+            result_df = pd.concat(required_rows).drop_duplicates(subset=['chunking_index'])
+            result_df = result_df.merge(queried_df, on = 'chunking_index', how = 'inner', suffixes = ['_old', ''])
+
+            for c in result_df.columns.values:
+                if '_old' in c:
+                    del result_df[c]
+
         return result_df
 
     @property
     def iloc(self):
         return self._iloc_indexer
+
+    @property
+    def loc(self):
+        return self._loc_indexer
 
     def _iloc_method(self, row_idx, col_idx=None):
         """
@@ -712,6 +915,8 @@ class SQLDataFrameWrapper:
         with sqlite3.connect(self.db_name) as conn:
             simple_df = pd.read_sql_query(f"SELECT {selected_columns} FROM data WHERE {row_selection_query}", conn)
 
+        simple_df = self._restore_types(simple_df)
+
         # Fetch the required chunks for the resulting DataFrame
         return self.fetch_all_for_df(simple_df)
 
@@ -729,6 +934,9 @@ if __name__ == "__main__":
          'c': [{'x': 10}] * 1000,
             'd': [("x", "y")] * 1000,
      })
+    df = df.set_index(np.arange(0, len(df), 1))
+    df['extra'] = 0
+    df['core_index'] = df.index.values
     wrapper = SQLDataFrameWrapper(df)
     print(wrapper.query("b.str.contains('date')"))
     wrapper['new_column'] = wrapper.apply(lambda x: x['b'][0:1], axis = 1)
@@ -748,11 +956,15 @@ if __name__ == "__main__":
     with open("./pickle_test.pickle", "rb") as f:
         wrapper = pickle.load(f)
 
-    wrapper.iloc[0:10]
+    print(wrapper.iloc[0:10].columns.values)
 
     t = wrapper.to_pandas()
     t['new_column3'] = [{'a' : 5}] * len(t)
+    print(wrapper.index.values)
     wrapper.update(t)
+    if True:
+        vals = [1, 2, 3]
+        wrapper.query("a in @vals")
 
     for tt in wrapper.chunked_dataframes():
         print(tt.new_column3.values)
