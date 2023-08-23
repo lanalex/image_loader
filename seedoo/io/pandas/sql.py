@@ -12,7 +12,6 @@ import tqdm
 import ast
 from concurrent.futures import ThreadPoolExecutor
 
-
 def pandas_query_to_sqlite(query_str):
     # Access calling frame's local and global variables
     frame = inspect.stack()[1]
