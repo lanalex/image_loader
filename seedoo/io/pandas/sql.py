@@ -44,7 +44,7 @@ def optimized_sqlite3_connect(*args, **kwargs):
     return conn
 
 # Monkey-patch sqlite3.connect with our optimized version.
-sqlite3.connect = optimized_sqlite3_connect
+#sqlite3.connect = optimized_sqlite3_connect
 
 original_to_sql = pd.DataFrame.to_sql
 
@@ -310,10 +310,10 @@ class SQLDataFrameWrapper:
         self._iloc_indexer = SQLDataFrameWrapper.IlocIndexer(self)
         self.append_lock = threading.Lock()
         self._loc_indexer = SQLDataFrameWrapper.LocIndexer(self)
-        self.thread_executor = ThreadPoolExecutor(8)  # Initializes a thread pool executor
+        self.thread_executor = ThreadPoolExecutor(2)  # Initializes a thread pool executor
         self.special_types = {}
         self.logger = logging.getLogger(__name__)
-        optimize_sqlite(db_name)
+        #optimize_sqlite(db_name)
 
 
         if df is not None:
@@ -517,7 +517,7 @@ class SQLDataFrameWrapper:
             raise ValueError("DataFrame must contain 'chunking_index' for updating.")
 
         with tqdm.tqdm(total=len(self.chunk_files), desc='Updating chunk files') as pbar:
-            for i, chunk_file in enumerate(self.chunk_files):
+            for i, chunk_file in self.chunk_files.items():
                 # Load the chunk using read_pickle with compression
                 pbar.update(1)
                 chunk_df = self.fetch_raw_chunk(chunk_file = chunk_file)
@@ -533,7 +533,7 @@ class SQLDataFrameWrapper:
                 # Save the updated chunk back using to_pickle with compression
                 self._chunk_cache[chunk_file] = updated_chunk
                 if self.always_commit:
-                    updated_chunk.to_pickle(chunk_file, compression='gzip')
+                    updated_chunk.to_pickle(chunk_file, compression='b')
 
             self.commit()
 
@@ -541,7 +541,7 @@ class SQLDataFrameWrapper:
     def chunked_dataframes(self):
         """ Generator to produce dataframes from the stored chunks."""
         with tqdm.tqdm(total = len(self.chunk_files), desc = 'Reading chunk files') as pbar:
-            for i, chunk_file in enumerate(self.chunk_files):
+            for i, chunk_file in self.chunk_files.items():
                 chunk = self.fetch_raw_chunk(None, chunk_file=chunk_file)
                 df_chunk = self._fetch_chunk(i, chunk)
                 pbar.update(1)
@@ -551,9 +551,11 @@ class SQLDataFrameWrapper:
         self.complex_columns = state['complex_columns']
         self.path = state['path']
         self.db_name = state['db_name']
+        self._cached_chunk_files = None
         self.special_types = state['special_types']
+        self._last_modified_time = None
         self._chunk_cache = {}
-        self.always_commit = state['always_commit']
+        self.always_commit = state.get('always_commit', False)
         self._loc_indexer = SQLDataFrameWrapper.LocIndexer(self)
         self.append_lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
@@ -583,23 +585,24 @@ class SQLDataFrameWrapper:
                                 raise
 
         num_chunks = max(1, len(df) // self.chunk_size)
-        for i, chunk in enumerate(np.array_split(df[complex_columns+ ["chunking_index"]].sort_values(by=['chunking_index']),
-                                                 num_chunks)):
-            chunk_id = int(chunk.chunking_index.max() // self.chunk_size)
-            filename = f"{os.path.join(self.path, 'chunks')}/chunk_{chunk_id}.pkl"
-            new_chunk = chunk[complex_columns + ["chunking_index"]]
-            if not os.path.exists(os.path.dirname(filename)):
-                os.makedirs(os.path.dirname(filename))
+        with self.append_lock:
+            for i, chunk in enumerate(np.array_split(df[complex_columns+ ["chunking_index"]].sort_values(by=['chunking_index']),
+                                                     num_chunks)):
+                chunk_id = int(chunk.chunking_index.mean() // self.chunk_size)
+                filename = f"{os.path.join(self.path, 'chunks')}/chunk_{chunk_id}.pkl"
+                new_chunk = chunk[complex_columns + ["chunking_index"]]
+                if not os.path.exists(os.path.dirname(filename)):
+                    os.makedirs(os.path.dirname(filename))
 
-            if os.path.exists(filename):
-                existing_chunk = self.fetch_raw_chunk(chunk_file=filename)
-                if append:
-                    new_chunk = pd.concat([existing_chunk, new_chunk])
+                if os.path.exists(filename):
+                    existing_chunk = self.fetch_raw_chunk(chunk_file=filename)
+                    if append:
+                        new_chunk = pd.concat([existing_chunk, new_chunk])
 
-                #if not append:
-                #    raise RuntimeError(f'Trying to append a chunk to an already existing one! {filename}')
+                    #if not append:
+                    #    raise RuntimeError(f'Trying to append a chunk to an already existing one! {filename}')
 
-            new_chunk.to_pickle(filename, compression='gzip')
+                new_chunk.to_pickle(filename, compression='gzip')
 
     @property
     def chunk_files(self):
@@ -613,9 +616,11 @@ class SQLDataFrameWrapper:
 
         # Check if the folder's modification time has changed
         current_modified_time = os.path.getmtime(chunks_dir)
-        if current_modified_time != self._last_modified_time or self._cached_chunk_files is None:
+        if current_modified_time != self._last_modified_time or self._cached_chunk_files is None or not self._cached_chunk_files:
             self._cached_chunk_files = [os.path.join(chunks_dir, f) for f in os.listdir(chunks_dir) if
                                         os.path.isfile(os.path.join(chunks_dir, f))]
+            print(self._cached_chunk_files)
+            self._cached_chunk_files = {int(os.path.basename(k).split("_")[1].split(".")[0]) : k for k in self._cached_chunk_files}
             self._last_modified_time = current_modified_time
 
         return self._cached_chunk_files
@@ -692,7 +697,7 @@ class SQLDataFrameWrapper:
             apply_along_axis = 'apply'  # Apply to each column (default behavior)
 
         # Iterate over chunks, apply function, and then store results
-        for chunk_idx in range(len(self.chunk_files)):
+        for chunk_idx, chunk_file in self.chunk_files.items():
             df_chunk = self._fetch_chunk(chunk_idx)
             if df_chunk.empty:
                 continue
@@ -728,7 +733,7 @@ class SQLDataFrameWrapper:
         cached_chunk = None  # To store the currently loaded chunk
 
         for index, row in sorted_simple_df.iterrows():
-            chunk_idx = max(int(row['chunking_index'] // self.chunk_size) - 1, 0)
+            chunk_idx = max(int(row['chunking_index'] // self.chunk_size), 0)
 
             # If current row's chunk isn't cached, load and update cache
             if chunk_idx != cached_chunk_idx:
@@ -754,7 +759,7 @@ class SQLDataFrameWrapper:
     def _update_chunk(self, df_chunk):
         # Determine the chunk file based on the 'chunking_index' of the dataframe
         chunk_indices = df_chunk["chunking_index"].max()
-        chunk_idx = max(int(chunk_indices // self.chunk_size) - 1, 0)
+        chunk_idx = max(int(chunk_indices // self.chunk_size), 0)
 
         simple_columns, complex_columns, special_types = SQLDataFrameWrapper.identify_column_types(df_chunk)
         # Split the columns into simple and complex
@@ -800,8 +805,14 @@ class SQLDataFrameWrapper:
 
 
     def commit(self):
+        # wait for all the threads to finish
+        self.thread_executor.shutdown(wait=True)
+        self.thread_executor = ThreadPoolExecutor(2)
+
+        # Start it again
+        self.thread_executor = ThreadPoolExecutor(2)
         with tqdm.tqdm(total = len(self.chunk_files), desc = 'Committng in memory chunks') as pbar:
-            for chunk_file in self.chunk_files:
+            for chunk_index, chunk_file in self.chunk_files.items():
                 if chunk_file in self._chunk_cache:
                     complex_columns_df = self._chunk_cache[chunk_file]
                     complex_columns_df.to_pickle(chunk_file, compression='gzip')
@@ -809,7 +820,7 @@ class SQLDataFrameWrapper:
 
     def __setitem__(self, key, value):
         self.logger.info('Doing setitem')
-        for chunk_idx in range(len(self.chunk_files)):
+        for chunk_idx, chunk_index in self.chunk_files.items():
             df_chunk = self._fetch_chunk(chunk_idx)
             if df_chunk.empty:
                 continue
@@ -847,7 +858,7 @@ class SQLDataFrameWrapper:
                 # If it's a complex column, we'd have to iterate over the chunks to aggregate the data
                 # (This could be resource-intensive for very large dataframes)
                 all_rows = []
-                for chunk_idx in range(len(self.chunk_files)):
+                for chunk_idx, chunk_file in self.chunk_files.items():
                     df_chunk = self._fetch_chunk(chunk_idx)
                     all_rows.append(df_chunk[item])
                 return pd.concat(all_rows)
@@ -855,8 +866,9 @@ class SQLDataFrameWrapper:
 
     def fetch_raw_chunk(self, chunk_index = None, chunk_file = None):
         if chunk_file is None:
-            if chunk_index >= len(self.chunk_files):
+            if int(chunk_index) not in self.chunk_files:
                 print(f'BAD CHUNK: {chunk_index} and chunk_files is: {self.chunk_files}')
+
             chunk_file = self.chunk_files[int(chunk_index)]
 
         if chunk_file not in self._chunk_cache:
@@ -882,7 +894,7 @@ class SQLDataFrameWrapper:
         required_rows = []
         cached_chunk_idx = -1  # Initialize with a non-existent chunk index
         cached_chunk = None  # To store the currently loaded chunk
-        indexes = [max(int(i // self.chunk_size) - 1, 0) for i in queried_df.chunking_index.unique()]
+        indexes = [max(int(i // self.chunk_size), 0) for i in queried_df.chunking_index.unique()]
 
         handled = set([])
         with tqdm.tqdm(desc = 'fetching full chunks to merge with query') as pbar:
@@ -1023,7 +1035,7 @@ if __name__ == "__main__":
     from pandarallel import pandarallel
 
     # Initialize pandarallel
-    pandarallel.initialize(nb_workers=6, progress_bar=True)
+    pandarallel.initialize(nb_workers=1, progress_bar=True)
 
 
     df = generate_dataframe()
