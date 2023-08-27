@@ -1,4 +1,7 @@
+import os
+import psutil
 import collections
+import multiprocessing
 import uuid
 
 import seedoo.logger_helpers.logger_setup
@@ -15,7 +18,10 @@ import asyncio
 import threading
 import tqdm
 import ast
+import json
 import time
+from seedoo.io.pandas.utils import FileCache
+
 from concurrent.futures import ThreadPoolExecutor
 pd.options.mode.chained_assignment = None
 
@@ -45,9 +51,64 @@ def optimized_sqlite3_connect(*args, **kwargs):
     return conn
 
 # Monkey-patch sqlite3.connect with our optimized version.
-#sqlite3.connect = optimized_sqlite3_connect
+sqlite3.connect = optimized_sqlite3_connect
 
 original_to_sql = pd.DataFrame.to_sql
+
+
+def custom_read_sql(sql, con, index_col = None, chunk_size=100_000):
+    # Create a cursor from the connection
+    cur = con.cursor()
+
+    # Execute the SQL statement
+    cur.execute(sql)
+
+    # Fetch the column names from the cursor description
+    columns = [col[0] for col in cur.description]
+
+    cur_pragma = con.cursor()
+
+    split = 'from' if 'from' in sql else 'FROM'
+    # If we want to infer the types from SQLite's table schema:
+    cur_pragma.execute(f"PRAGMA table_info({sql.split(split)[1].split()[0]})")
+    type_mapping = {row[1]: row[2].lower() for row in cur_pragma.fetchall()}
+    cur_pragma.close()
+
+    def get_dtype(col_name):
+        sqlite_type = type_mapping[col_name]
+        if sqlite_type in ["int", "integer", "tinyint", "smallint", "mediumint", "bigint", "unsigned big int", "int2", "int8"]:
+            return "int"
+        elif sqlite_type in ["real", "double", "double precision", "float"]:
+            return "float"
+        elif sqlite_type in ["text", "char", "varchar", "clob"]:
+            return "object"
+        elif sqlite_type in ["blob"]:
+            return "bytes"
+        else:
+            # Default to object for unrecognized or mixed types.
+            return "object"
+
+    dtypes = {col: get_dtype(col) for col in columns}
+
+    dfs = []
+
+    with tqdm.tqdm(desc="Fetching rows") as pbar:
+        while True:
+            data_chunk = cur.fetchmany(chunk_size)
+            if not data_chunk:
+                break
+
+            n = np.array(data_chunk)
+            dfs.append(n)
+            pbar.update(len(data_chunk))
+
+    cur.close()
+
+    if len(dfs) == 0:
+        return pd.DataFrame([], columns=columns).astype(dtypes)
+
+    df = pd.DataFrame(np.concatenate(dfs, axis = 0), columns = columns).astype(dtypes)
+    return df
 
 
 def custom_to_sql(
@@ -82,6 +143,8 @@ def custom_to_sql(
 
         original_to_sql(df.iloc[:1], name, con, if_exists=if_exists, index=False, index_label=index_label,
                         dtype=dtype)
+
+        con.commit()
         df = df.iloc[1:]
         if_exists = 'append'  # Switch to 'append' mode for the remaining rows
         end = time.time()
@@ -90,34 +153,35 @@ def custom_to_sql(
 
     # Create a connection and cursor
     if if_exists == 'append':
-        with con:
-            cur = con.cursor()
-            # Calculate chunk size, if not provided
-            chunksize = chunksize or 100_000
-            column_names = ", ".join([f'{col}' for col in df.columns])
-            # Prepare the placeholders
-            num_columns = len(df.columns)
-            placeholders = ", ".join(["?"] * num_columns)
+        cur = con.cursor()
+        # Calculate chunk size, if not provided
+        chunksize = chunksize or 100_000
+        column_names = ", ".join([f'{col}' for col in df.columns])
+        # Prepare the placeholders
+        num_columns = len(df.columns)
+        placeholders = ", ".join(["?"] * num_columns)
 
-            with tqdm.tqdm(total = int(len(df) // chunksize) + 1, desc = 'SQLLite batch insert') as pbar:
-                for start in range(0, len(df), chunksize):
-                    end = start + chunksize
-                    batch = df.iloc[start:end]
-                    # Extract column names from the DataFrame
-                    data = [tuple(row) for row in batch.values]
+        with tqdm.tqdm(total = int(len(df) // chunksize) + 1, desc = 'SQLLite batch insert') as pbar:
+            for start in range(0, len(df), chunksize):
+                end = start + chunksize
+                batch = df.iloc[start:end]
+                # Extract column names from the DataFrame
+                data = [tuple(row) for row in batch.values]
 
-                    cur.execute("BEGIN;")
-                    # Execute the in sert with explicit column names
-                    cur.executemany(f"INSERT INTO {name} ({column_names}) VALUES ({placeholders})", data)
-                    logging.getLogger(__name__).info('Committing for batch')
-                    con.commit()
-                    logging.getLogger(__name__).info('Done committing for batch')
-                    pbar.update(1)
-            cur.close()
+                cur.execute("BEGIN;")
+                # Execute the in sert with explicit column names
+                cur.executemany(f"INSERT INTO {name} ({column_names}) VALUES ({placeholders})", data)
+                logging.getLogger(__name__).info('Committing for batch')
+                con.commit()
+                logging.getLogger(__name__).info('Done committing for batch')
+                pbar.update(1)
+        cur.close()
 
 # Monkey patch pandas DataFrame's to_sql with our custom version
 pd.DataFrame.to_sql = custom_to_sql
-
+origin_read_sql = pd.read_sql
+pd.DataFrame.read_sql = custom_read_sql
+pd.read_sql = custom_read_sql
 
 def pandas_query_to_sqlite(query_str):
     # Access calling frame's local and global variables
@@ -177,8 +241,8 @@ class DataFrameGroupByWrapper:
     def parallel_apply(self, func, *args, **kwargs):
         results = []
 
-        for groupby_obj in self.groupby_generators:
-            result_chunk = groupby_obj.apply(func, *args, **kwargs)
+        for index, groupby_obj in self.groupby_generators:
+            result_chunk = groupby_obj.parallel_apply(func, *args, **kwargs)
             results.append(result_chunk)
 
         # Concatenate results from all chunks
@@ -210,35 +274,34 @@ class DataFrameGroupByWrapper:
         return pd.concat(results, axis=0)
 
 
-def optimize_sqlite(db_name, desired_cache_size_gb=1):
+def optimize_sqlite(conn, desired_cache_size_gb=8):
     # Convert desired cache size from GB to bytes
     desired_cache_size_bytes = desired_cache_size_gb * 1024 ** 3
 
     # Connect to the SQLite database
-    with sqlite3.connect(db_name) as conn:
-        cur = conn.cursor()
+    cur = conn.cursor()
 
-        # Get the page size
-        cur.execute("PRAGMA page_size;")
-        page_size = cur.fetchone()[0]
+    # Get the page size
+    cur.execute("PRAGMA page_size;")
+    page_size = cur.fetchone()[0]
 
-        # Calculate the number of pages required for the desired cache size
-        num_pages = desired_cache_size_bytes // page_size
+    # Calculate the number of pages required for the desired cache size
+    num_pages = desired_cache_size_bytes // page_size
 
-        # Set the cache size
-        cur.execute(f"PRAGMA cache_size=-{num_pages};")
+    # Set the cache size
+    cur.execute(f"PRAGMA cache_size={num_pages};")
 
-        # Set other performance enhancing pragmas
-        cur.execute("PRAGMA journal_mode=WAL;")
-        cur.execute("PRAGMA synchronous=NORMAL;")
+    # Set other performance enhancing pragmas
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute("PRAGMA synchronous=NORMAL;")
 
-        # Set memory-mapped I/O size
-        mmap_size = desired_cache_size_bytes  # Setting it to the same size as the cache for simplicity
-        cur.execute(f"PRAGMA mmap_size={mmap_size};")
+    # Set memory-mapped I/O size
+    mmap_size = desired_cache_size_bytes  # Setting it to the same size as the cache for simplicity
+    cur.execute(f"PRAGMA mmap_size={mmap_size};")
 
-        # Commit changes and close the connection
-        conn.commit()
-
+    cur.close()
+    # Commit changes and close the connection
+    conn.commit()
 
 
 class SQLDataFrameWrapper:
@@ -308,10 +371,11 @@ class SQLDataFrameWrapper:
                 col_idx = None
                 return self.wrapper._iloc_method(row_idx, col_idx)
 
-    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 100_000):
+    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 50_000):
         self.db_name = os.path.join(path, db_name)
         self.complex_columns = []
-        self._chunk_cache = {}
+        self._chunk_cache = FileCache()
+        self.eval_cache = {}
         self.path = path
         self.chunk_size = chunk_size
         self.always_commit = False
@@ -321,8 +385,7 @@ class SQLDataFrameWrapper:
         self.thread_executor = ThreadPoolExecutor(2)  # Initializes a thread pool executor
         self.special_types = {}
         self.logger = logging.getLogger(__name__)
-        #optimize_sqlite(db_name)
-
+        self._connection = None
 
         if df is not None:
             # If append mode, fetch the max chunking_index from the DB and adjust the new df's chunking_index accordingly
@@ -332,15 +395,32 @@ class SQLDataFrameWrapper:
             self.special_types.update(special_types)
             self._store_data(df, append = False)
 
+    @property
+    def connection(self):
+        if self._connection is None:
+            self._connection = sqlite3.connect(self.db_name, check_same_thread=False)
+            optimize_sqlite(self._connection)
+
+        return self._connection
+
+    def __len__(self):
+        return self.connection.execute("select count(*) from data").fetchone()[0]
+
+    def __del__(self):
+        self.connection.close()
 
     def _loc_method(self, row_labels, col_labels=None):
         # Handle the logic for .loc indexer
 
         # Convert row_labels to a DataFrame for insertion to temp table
-        temp_df = pd.DataFrame({'chunking_index': row_labels})
+        if len(row_labels) < 100:
+            ids = ",".join([str(i) for i in row_labels])
+            subset_df = pd.read_sql(f"select * from data where chunking_index in ({ids})", self.connection)
+        else:
+            temp_df = pd.DataFrame({'chunking_index': row_labels})
 
-        # Insert row_labels into a temp table
-        with sqlite3.connect(self.db_name) as conn:
+            # Insert row_labels into a temp table
+            conn = self.connection
             temp_df.to_sql("temp_table", conn, if_exists="replace", index=False, method='multi')
 
             conn.execute(f"CREATE INDEX chunking_index_idx_temp_table ON temp_table (chunking_index)")
@@ -355,8 +435,7 @@ class SQLDataFrameWrapper:
 
             conn.execute(f"DROP TABLE temp_table")
 
-
-        # Handle column selection if provided in col_labels
+            # Handle column selection if provided in col_labels
         if col_labels:
             subset_df = subset_df[col_labels]
 
@@ -395,22 +474,25 @@ class SQLDataFrameWrapper:
 
         for c in df.columns.values:
             # Check for numeric types and adjust data types if needed
-            if isinstance(df[c].values[0], (str, float, int, np.float32, np.int32, np.float64, np.int64, tuple, bool, np.bool_)):
+            if isinstance(df[c].values[0], (str, float, int, np.float32, np.int32, np.float64, np.int64, bool, np.bool_)):
                 simple_cols.append(c)
-                if isinstance(df[c].values[0], (np.bool_)):
+                if isinstance(df[c].values[0], (np.bool_, bool,)):
                     df[c] = df[c].apply(lambda x: bool(x))
-
-                elif isinstance(df[c].values[0], (tuple,)):
-                    df[c] = df[c].apply(lambda x: str(tuple([safely_convert(i) for i in x])) if not pd.isnull(x) else str((0,)))
-                    special_types[c] = tuple
                 elif isinstance(df[c].values[0], np.int64):
                     df[c] = df[c].astype(np.int32)
                 elif isinstance(df[c].values[0], np.float64):
                     df[c] = df[c].astype(np.float32)
             else:
-                complex_cols.append(c)
+                if isinstance(df[c].values[0], (tuple,dict,)):
+                    special_types[c] = type(df[c].values[0])
+                    df[c] = df[c].apply(lambda x: str(x))
+                    simple_cols.append(c)
+                else:
+                    complex_cols.append(c)
 
         complex_cols.append("chunk_id")
+        complex_cols.append("chunking_index")
+
         if 'chunk_id' not in simple_cols:
             simple_cols.append("chunk_id")
 
@@ -448,81 +530,113 @@ class SQLDataFrameWrapper:
         columns_to_use = ", ".join([f"a.{col} as {col}" for col in columns_to_use])
         columns_to_add_or_update = ", ".join([f"b.{col} as {col}" for col in provided_simple_cols if col != 'chunking_index'])
 
-        with sqlite3.connect(self.db_name) as conn:
-            # Step 3: Insert the new DataFrame into a temporary table
-            self.logger.info(f'Inserting df of length {len(df)} into temp table for update')
-            temp_table_name = f'temp_new_data_{str(uuid.uuid1()).replace("-", "")}'
-            conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
-            df[provided_simple_cols].to_sql(temp_table_name, conn, if_exists='replace', index=False, method='multi')
+        conn = self.connection
+        # Step 3: Insert the new DataFrame into a temporary table
+        self.logger.info(f'Inserting df of length {len(df)} into temp table for update')
+        temp_table_name = f'temp_new_data_{str(uuid.uuid1()).replace("-", "")}'
+        conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
+        df[provided_simple_cols].to_sql(temp_table_name, conn, if_exists='replace', index=False, method='multi')
 
-            self.logger.info(f'Creating indexes for columns')
-            # Step 6: Re-add indices to the new data table
-            conn.execute(f"CREATE INDEX chunking_index_idx_{temp_table_name} ON {temp_table_name} (chunking_index)")
+        self.logger.info(f'Creating indexes for columns')
+        # Step 6: Re-add indices to the new data table
+        conn.execute(f"CREATE INDEX chunking_index_idx_{temp_table_name} ON {temp_table_name} (chunking_index)")
 
-            if swap:
-                conn.execute("DROP TABLE data")
-                conn.execute(f"ALTER TABLE {temp_table_name} RENAME TO data")
-                conn.commit()
-            else:
-                self.logger.info(f'Joining temp table with main table for update')
-                # Step 4: Join the temp table with the main data table
-                conn.execute(f"""
-                    CREATE TABLE temp_combined_data AS
-                    SELECT {columns_to_use},{columns_to_add_or_update}
-                    FROM data AS a
-                    INNER JOIN {temp_table_name} AS b
-                    ON a.chunking_index = b.chunking_index
-                """)
+        if swap:
+            conn.execute("DROP TABLE data")
+            conn.execute(f"ALTER TABLE {temp_table_name} RENAME TO data")
+            conn.commit()
+        else:
+            self.logger.info(f'Joining temp table with main table for update')
+            # Step 4: Join the temp table with the main data table
+            conn.execute(f"""
+                CREATE TABLE temp_combined_data AS
+                SELECT {columns_to_use},{columns_to_add_or_update}
+                FROM data AS a
+                INNER JOIN {temp_table_name} AS b
+                ON a.chunking_index = b.chunking_index
+            """)
 
-                # Step 5: Swap tables
-                self.logger.info('Dropping data and renaming the temp table')
+            # Step 5: Swap tables
+            self.logger.info('Dropping data and renaming the temp table')
 
-                conn.execute("DROP TABLE data")
-                conn.execute("ALTER TABLE temp_combined_data RENAME TO data")
-                conn.execute(f"DROP TABLE {temp_table_name}")
-                conn.commit()
+            conn.execute("DROP TABLE data")
+            conn.execute("ALTER TABLE temp_combined_data RENAME TO data")
+            conn.execute(f"DROP TABLE {temp_table_name}")
+            conn.commit()
 
-            for col in provided_simple_cols:
-                if col != 'index':
-                    try:
-                        conn.execute(f"CREATE INDEX idx_{col} ON data ({col})")
-                        conn.commit()
-                    except sqlite3.OperationalError as exc:
-                        if "already exists" in exc.args[0]:
-                            pass
-                        else:
-                            raise
+        for col in provided_simple_cols:
+            if col != 'index':
+                try:
+                    conn.execute(f"CREATE INDEX idx_{col} ON data ({col})")
+                    conn.commit()
+                except sqlite3.OperationalError as exc:
+                    if "already exists" in exc.args[0]:
+                        pass
+                    else:
+                        raise
 
-            self.logger.info('Creating indexes')
+        self.logger.info('Creating indexes')
+        remaining_complex_columns = set(provided_complex_cols) - set(["chunking_index", "chunk_id"])
 
-        if provided_complex_cols:
-            self._chunk_cache = {}
+        if remaining_complex_columns:
             self.logger.info('Handling complex columns')
-            self.update_chunked_dataframes(df[provided_complex_cols + ["chunking_index"]])
+            self.update_chunked_dataframes(df[provided_complex_cols])
 
 
-    def groupby(self, *args, **kwargs):
+    def _update_complex_columns(self):
+        chunk = self.fetch_raw_chunk(0)
+        self.complex_columns = list(chunk.columns.values)
+
+    def groupby(self, by=None, axis=0, level=None, as_index=True, sort=True,
+                group_keys=True, squeeze=None, observed=False, dropna=True):
         # This will be a generator
-        def groupby_gen():
-            for df_chunk in self.chunked_dataframes():
-                yield df_chunk.groupby(*args, **kwargs)
 
+        complex_overlap = set(by) & set(self.complex_columns)
+        complex_overlap = complex_overlap - set(['chunking_index', 'chunk_id'])
+
+        if complex_overlap:
+            raise ValueError(f'Only simple columns can be used in a group by. You provided these complex columns: {list(complex_overlap)}')
+
+        by = [i for i in by if i in self.simple_columns]
+        columns_list = ",".join(by)
+
+        df = self._inner_query(f"select distinct {columns_list} from data", fetch_complex=False)
+
+        def fetch_value(row, column):
+            val = row[column]
+            if isinstance(val, (str,)):
+                return f"'{val}'"
+            elif column in self.special_types:
+                return str(val)
+            else:
+                return val
+
+        def groupby_gen():
+            nonlocal df
+            for index, row in df.iterrows():
+                query = " and ".join([f"{column}=={fetch_value(row, column)}" for column in by])
+                df = self.query(query)
+                if group_keys:
+                    yield tuple([row[column] for column in by]), df
+                else:
+                    yield index, df
         return DataFrameGroupByWrapper(groupby_gen())
 
     @property
     def simple_df(self):
-        with sqlite3.connect(self.db_name) as conn:
-            query = "SELECT {cols} FROM data".format(cols=", ".join(self.simple_columns))
-            df = pd.read_sql(query, conn)
+        conn = self.connection
+        query = "SELECT {cols} FROM data".format(cols=", ".join(self.simple_columns))
+        df = pd.read_sql(query, conn)
         return df
 
     def to_pandas(self):
         """
         :return: Only the simple columns table as a simple pandas dataframe
         """
-        with sqlite3.connect(self.db_name) as conn:
-            # Using a parameterized query to fetch records based on the chunking indices
-            df_simple = pd.read_sql("SELECT * FROM data", conn)
+        conn = self.connection
+
+        # Using a parameterized query to fetch records based on the chunking indices
+        df_simple = pd.read_sql("SELECT * FROM data", conn)
 
         df_simple = self._restore_types(df_simple)
         return df_simple.set_index(df_simple.chunking_index.values)
@@ -548,6 +662,21 @@ class SQLDataFrameWrapper:
                 chunk_df = self.fetch_raw_chunk(chunk_file = chunk_file)
 
                 # Update the chunk using merge on the 'chunking_index'
+                # Hack to fix data corruption bug of already existing data, remove after first iteation. Temp
+                had_fixes = False
+                for c in chunk_df.columns.values:
+                    vals = chunk_df[c].values
+                    if len(vals.shape) > 1 and vals.shape[1] > 1:
+                        print(f'BAD DOUBLE COLUMN: {c}, DUPS: {vals.shape}')
+                        vals = vals[:, 0]
+                        del chunk_df[c]
+                        chunk_df[c] = vals
+                        had_fixes = True
+
+                if had_fixes:
+                    chunk_df = chunk_df.copy()
+                    self._chunk_cache[chunk_file] = chunk_df
+
                 updated_chunk = pd.merge(chunk_df, df, on=["chunking_index", "chunk_id"], how="inner", suffixes=['_old', '_new'])
                 updated_chunk = updated_chunk[[c for c in updated_chunk.columns.values if "_old" not in c]]
 
@@ -555,17 +684,18 @@ class SQLDataFrameWrapper:
                 renamed_to_orig = collections.defaultdict(lambda: [])
                 for c in updated_chunk.columns.values:
                     if '_new' in c:
-                        rename[c] = c.replace("_new", "")
-                        renamed_to_orig[rename[c]].append(c)
-                        if len(renamed_to_orig[rename[c]]) > 1:
-                            raise RuntimeError('Problem, too many columns with the same name!')
+                        new_name = c.replace("_new", "")
+                        if len(renamed_to_orig[new_name]) == 0:
+                            rename[c] = new_name
+                            renamed_to_orig[rename[c]].append(c)
+                        else:
+                            if new_name in updated_chunk:
+                                del updated_chunk[new_name]
 
                 updated_chunk = updated_chunk.rename(columns = rename)
 
                 # Save the updated chunk back using to_pickle with compression
                 self._chunk_cache[chunk_file] = updated_chunk
-                if self.always_commit:
-                    updated_chunk.to_pickle(chunk_file, compression='b')
 
             self.commit()
 
@@ -587,51 +717,52 @@ class SQLDataFrameWrapper:
         self.special_types = state['special_types']
         self._last_modified_time = None
         self.thread_executor = ThreadPoolExecutor(2)
-        self._chunk_cache = {}
+        self._chunk_cache = FileCache()
         self.always_commit = state.get('always_commit', False)
         self._loc_indexer = SQLDataFrameWrapper.LocIndexer(self)
+        self._connection = None
         self.append_lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
         self.chunk_size = state['chunk_size']
+        self.eval_cache = {}
         self._iloc_indexer = SQLDataFrameWrapper.IlocIndexer(self)
+        self._update_complex_columns()
 
     def _store_data(self, df, append=False):
-        df['chunk_id'] = df['chunking_index'].apply(lambda x: x // self.chunk_size)
+        df['chunk_id'] = df['chunking_index'].apply(lambda x: int(np.floor(x / self.chunk_size)))
         _simple_columns, complex_columns, special_types = SQLDataFrameWrapper.identify_column_types(df)
         self.special_types.update(special_types)
         simple_columns_df = df[_simple_columns]
 
         with self.append_lock:
             # Save simple columns to SQLite
-            with sqlite3.connect(self.db_name) as conn:
-                if append:
-                    simple_columns_df = simple_columns_df[self.simple_columns]
-                    simple_columns_df.to_sql("data", conn, index=True, if_exists="append")
-                else:
-                    simple_columns_df.to_sql("data", conn, index=True, if_exists="replace")
-                    for col in self.simple_columns + ["chunking_index"]:
-                        try:
-                            conn.execute(f"CREATE INDEX idx_{col} ON data ({col})")
-                        except sqlite3.OperationalError as exc:
-                            if "already exists" in exc.args[0]:
-                                pass
-                            else:
-                                raise
+            conn = self.connection
+            if append:
+                simple_columns_df = simple_columns_df[self.simple_columns]
+                simple_columns_df.to_sql("data", conn, index=True, if_exists="append")
+            else:
+                simple_columns_df.to_sql("data", conn, index=True, if_exists="replace")
+                for col in self.simple_columns:
+                    try:
+                        conn.execute(f"CREATE INDEX idx_{col} ON data ({col})")
+                    except sqlite3.OperationalError as exc:
+                        if "already exists" in exc.args[0]:
+                            pass
+                        else:
+                            raise
 
-        num_chunks = max(1, len(df) // self.chunk_size)
         with self.append_lock:
             for chunk_id, chunk in df.groupby(['chunk_id'], group_keys = True, as_index = False):
                 chunk_id = chunk_id[0]
                 filename = f"{os.path.join(self.path, 'chunks')}/chunk_{chunk_id}.pkl"
-                new_chunk = chunk[complex_columns + ["chunking_index"]]
+                new_chunk = chunk[complex_columns]
                 if not os.path.exists(os.path.dirname(filename)):
                     os.makedirs(os.path.dirname(filename))
 
                 if os.path.exists(filename):
-                    existing_chunk = self.fetch_raw_chunk(chunk_file=filename)
+                    existing_chunk = pd.read_pickle(filename, compression='gzip')
                     if append:
                         new_chunk = pd.concat([existing_chunk, new_chunk])
-                        new_chunk = new_chunk.drop_duplicates(subset = ['chunking_index'])
 
                     #if not append:
                     #    raise RuntimeError(f'Trying to append a chunk to an already existing one! {filename}')
@@ -652,28 +783,18 @@ class SQLDataFrameWrapper:
         current_modified_time = os.path.getmtime(chunks_dir)
         if current_modified_time != self._last_modified_time or self._cached_chunk_files is None or not self._cached_chunk_files:
             self._cached_chunk_files = [os.path.join(chunks_dir, f) for f in os.listdir(chunks_dir) if
-                                        os.path.isfile(os.path.join(chunks_dir, f))]
+                                        os.path.isfile(os.path.join(chunks_dir, f)) and f.endswith("pkl")]
             self._cached_chunk_files = {int(os.path.basename(k).split("_")[1].split(".")[0]) : k for k in self._cached_chunk_files}
             self._last_modified_time = current_modified_time
 
         return self._cached_chunk_files
 
+
     def _restore_types(self, df):
-        parsed_cache = {}
+        from seedoo.io.pandas.restore_types import _restore_types
+        return _restore_types(df, self.special_types)
 
-        def safe_eval(x):
-            try:
-                return ast.literal_eval(x)
-            except Exception as exc:
-                raise
-
-        for c,val in self.special_types.items():
-            self.logger.info(f'Restoring types for {c} its type is: {val}')
-            df[c] = df[c].progress_apply(lambda x: safe_eval(x))
-
-        return df
-
-    def append(self, df, blocking=False):
+    def append(self, df, blocking=True):
         if not blocking:
             self.thread_executor.submit(self._sync_append, df)
             return
@@ -692,26 +813,27 @@ class SQLDataFrameWrapper:
         if df_complex is None:
             df_complex = self.fetch_raw_chunk(int(chunk_idx))
 
-        with sqlite3.connect(self.db_name) as conn:
-            # Step 1 & 2: Create a temporary table and insert chunking indices
-            df_complex['chunking_index'] = df_complex['chunking_index'].astype(np.int32)
-            start = time.time()
-            df_complex[['chunking_index']].to_sql('tmp_chunking_indices', conn, if_exists='replace', index=False)
-            conn.execute(f"CREATE INDEX chunking_index_idx_tmp_chunking_indices ON tmp_chunking_indices (chunking_index)")
-            # Step 3: Perform a join to fetch the relevant rows
-            query = """
-            SELECT data.*
-            FROM data
-            INNER JOIN tmp_chunking_indices ON data.chunking_index = tmp_chunking_indices.chunking_index
-            """
-            end = time.time()
-            self.logger.info(f'Joining tmp_chunking_indices with data took: {(end - start) * 1000} ms')
+        conn = self.connection
 
-            df_simple = pd.read_sql(query, conn)
-            df_simple = self._restore_types(df_simple)
+        # Step 1 & 2: Create a temporary table and insert chunking indices
+        df_complex['chunking_index'] = df_complex['chunking_index'].astype(np.int32)
+        start = time.time()
+        df_complex[['chunking_index']].to_sql('tmp_chunking_indices', conn, if_exists='replace', index=False)
+        conn.execute(f"CREATE INDEX chunking_index_idx_tmp_chunking_indices ON tmp_chunking_indices (chunking_index)")
+        # Step 3: Perform a join to fetch the relevant rows
+        query = """
+        SELECT data.*
+        FROM data
+        INNER JOIN tmp_chunking_indices ON data.chunking_index = tmp_chunking_indices.chunking_index
+        """
+        end = time.time()
+        self.logger.info(f'Joining tmp_chunking_indices with data took: {(end - start) * 1000} ms')
 
-            # Step 4: Drop the temporary table
-            conn.execute("DROP TABLE tmp_chunking_indices")
+        df_simple = pd.read_sql(query, conn)
+        df_simple = self._restore_types(df_simple)
+
+        # Step 4: Drop the temporary table
+        conn.execute("DROP TABLE tmp_chunking_indices")
 
         _, complex_columns, _ = SQLDataFrameWrapper.identify_column_types(df_complex)
         if 'index' in df_simple:
@@ -720,7 +842,7 @@ class SQLDataFrameWrapper:
         if 'index' in df_complex:
             del df_complex['index']
 
-        df_combined = pd.merge(df_simple, df_complex[complex_columns + ["chunking_index"]], on=["chunk_id", "chunking_index"], suffixes=['', '_conflict'])
+        df_combined = pd.merge(df_simple, df_complex[complex_columns], on=["chunk_id", "chunking_index"], suffixes=['', '_conflict'])
         return df_combined
 
     def drop_duplicates(self, subset = []):
@@ -763,6 +885,9 @@ class SQLDataFrameWrapper:
         return self
 
     def fetch_all_for_df(self, simple_df):
+        if len(simple_df) == 0:
+            return simple_df
+
         # Sort input simple_df by chunking_index for efficient chunk retrieval
         sorted_simple_df = simple_df.sort_values(by="chunking_index")
 
@@ -771,17 +896,12 @@ class SQLDataFrameWrapper:
         cached_chunk_idx = -1  # Initialize with a non-existent chunk index
         cached_chunk = None  # To store the currently loaded chunk
 
-        for index, row in sorted_simple_df.iterrows():
-            chunk_idx = max(int(row['chunking_index'] // self.chunk_size), 0)
-
+        for chunk_id in sorted_simple_df.chunk_id.unique():
             # If current row's chunk isn't cached, load and update cache
-            if chunk_idx != cached_chunk_idx:
-                cached_chunk = pd.read_pickle(self.chunk_files[chunk_idx], compression='gzip')
-                cached_chunk_idx = chunk_idx
+            cached_chunk = self.fetch_raw_chunk(chunk_id)
 
             # Use cached_chunk to extract the necessary rows
-            matched_df = cached_chunk[cached_chunk["chunking_index"] == row['chunking_index']]
-            required_rows.append(matched_df)
+            required_rows.append(cached_chunk)
 
         result_df = pd.concat(required_rows).drop_duplicates(subset=['chunking_index'])
         result_df = result_df.merge(simple_df[self.simple_columns], on = ['chunking_index', 'chunk_id'])
@@ -790,8 +910,8 @@ class SQLDataFrameWrapper:
     @property
     def index(self):
         with self.append_lock:
-            with sqlite3.connect(self.db_name) as conn:
-                result = conn.execute("SELECT distinct chunking_index FROM data order by chunking_index asc").fetchall()
+            conn = self.connection
+            result = conn.execute("SELECT chunking_index FROM data order by chunking_index asc").fetchall()
             result = [i[0] for i in result]
             return pd.Series(list(result))
 
@@ -800,46 +920,48 @@ class SQLDataFrameWrapper:
         simple_columns, complex_columns, special_types = SQLDataFrameWrapper.identify_column_types(df_chunk)
         # Split the columns into simple and complex
         simple_columns_df = df_chunk[simple_columns]
-        complex_columns_df = df_chunk[complex_columns + ['chunking_index']]
 
-        with sqlite3.connect(self.db_name) as conn:
-            # Get existing columns in the SQLite database
-            existing_columns = conn.execute("PRAGMA table_info(data)").fetchall()
-            existing_column_names = [col[1] for col in existing_columns]
+        complex_columns_df = None
+        if len(complex_columns) > 0:
+            complex_columns_df = df_chunk[complex_columns]
 
-            first = True
-            update_cols = [col for col in simple_columns_df.columns if col in existing_column_names]
-            insert_cols = [col for col in simple_columns_df.columns if col not in existing_column_names]
+        conn = self.connection
 
-            # Update or Add the simple columns in the SQLite DB
-            for _, row in simple_columns_df.iterrows():
-                # Determine columns that are being updated vs columns that are being added
+        # Get existing columns in the SQLite database
+        existing_columns = conn.execute("PRAGMA table_info(data)").fetchall()
+        existing_column_names = [col[1] for col in existing_columns]
 
-                if update_cols:
-                    cols_str = ', '.join([f'"{col}" = ?' for col in update_cols])
-                    query = f'UPDATE data SET {cols_str} WHERE chunking_index = ?'
-                    values = [row[col] for col in update_cols] + [row.chunking_index]
+        first = True
+        update_cols = [col for col in simple_columns_df.columns if col in existing_column_names]
+        insert_cols = [col for col in simple_columns_df.columns if col not in existing_column_names]
+
+        # Update or Add the simple columns in the SQLite DB
+        for _, row in simple_columns_df.iterrows():
+            # Determine columns that are being updated vs columns that are being added
+
+            if update_cols:
+                cols_str = ', '.join([f'"{col}" = ?' for col in update_cols])
+                query = f'UPDATE data SET {cols_str} WHERE chunking_index = ?'
+                values = [row[col] for col in update_cols] + [row.chunking_index]
+                conn.execute(query, values)
+
+            if insert_cols:
+                for col in list(set(insert_cols)):
+                    # Create new columns for the missing ones
+                    if first:
+                        conn.execute(f"ALTER TABLE data ADD COLUMN {col}")
+                        first = False
+
+                    # And then insert the data into these new columns
+                    query = f'UPDATE data SET "{col}" = ? WHERE chunking_index = ?'
+                    values = [row[col], row.chunking_index]
                     conn.execute(query, values)
 
-                if insert_cols:
-                    for col in list(set(insert_cols)):
-                        # Create new columns for the missing ones
-                        if first:
-                            conn.execute(f"ALTER TABLE data ADD COLUMN {col}")
-                            first = False
-
-                        # And then insert the data into these new columns
-                        query = f'UPDATE data SET "{col}" = ? WHERE chunking_index = ?'
-                        values = [row[col], row.chunking_index]
-                        conn.execute(query, values)
-
         # Update the complex columns in the pickle chunk
-        for chunk_id, chunk in complex_columns_df.groupby(['chunk_id'], group_keys = True, as_index = False):
-            chunk_id = chunk_id[0]
-            self._chunk_cache[self.chunk_files[chunk_id]] = chunk
-
-            if self.always_commit:
-                chunk.to_pickle(self.chunk_files[chunk_id], compression = 'gzip')
+        if complex_columns_df is not None:
+            for chunk_id, chunk in complex_columns_df.groupby(['chunk_id'], group_keys = True, as_index = False):
+                chunk_id = chunk_id[0]
+                self._chunk_cache[self.chunk_files[chunk_id]] = chunk
 
 
     def commit(self):
@@ -847,48 +969,52 @@ class SQLDataFrameWrapper:
         self.thread_executor.shutdown(wait=True)
         self.thread_executor = ThreadPoolExecutor(2)
 
-        with tqdm.tqdm(total = len(self.chunk_files), desc = 'Committng in memory chunks') as pbar:
-            for chunk_index, chunk_file in self.chunk_files.items():
-                if chunk_file in self._chunk_cache:
-                    complex_columns_df = self._chunk_cache[chunk_file]
-                    complex_columns_df.to_pickle(chunk_file, compression='gzip')
-                pbar.update(1)
+        self._chunk_cache.commit()
 
     def __setitem__(self, key, value):
-        self.logger.info('Doing setitem')
-        for chunk_idx, chunk_index in self.chunk_files.items():
-            df_chunk = self._fetch_chunk(chunk_idx)
-            if df_chunk.empty:
-                continue
-            df_chunk[key] = value if isinstance(value, (int, float, str)) else value[
-                                                                               df_chunk.index.min():df_chunk.index.max() + 1]
 
-            self._update_chunk(df_chunk)
+        indexes = self.index.values
 
+        if isinstance(value, pd.Series):
+            value = value.values
+        else:
+            if not isinstance(value, (list, np.ndarray)):
+                value = [value] * len(indexes)
+
+        temp_df = pd.DataFrame({key: value, 'chunking_index' : indexes})
+        temp_df['chunk_id'] = temp_df['chunking_index'].apply(lambda x: int(np.floor(x / self.chunk_size)))
+
+        simple_columns, complex_columns, special_types = self.identify_column_types(temp_df)
+        self._update_chunk(temp_df)
         self.logger.info('Finished setitem')
-    def __len__(self):
-        with sqlite3.connect(self.db_name) as conn:
-            result = conn.execute("SELECT count(*) FROM data").fetchone()[0]
 
-        return result
 
     @property
     def simple_columns(self):
-        with sqlite3.connect(self.db_name) as conn:
-            # Get existing columns in the SQLite database
-            existing_columns = conn.execute("PRAGMA table_info(data)").fetchall()
-            existing_column_names = [col[1] for col in existing_columns]
+        conn = self.connection
+
+        # Get existing columns in the SQLite database
+        existing_columns = conn.execute("PRAGMA table_info(data)").fetchall()
+        existing_column_names = [col[1] for col in existing_columns]
 
         # Exclude 'chunking_index' and 'index'
         return [col for col in existing_column_names if col not in ['index']]
 
+    def __getattr__(self, attr):
+        if attr in self.__dict__:
+            super().__getattribute__(attr)
+
+        elif attr in self.simple_columns:
+            return self.__getitem__(attr)
+        else:
+            return False
 
     def __getitem__(self, item):
         if isinstance(item, str):
             if item in self.simple_columns:
                 # Fetch entire column from SQLite DB
-                with sqlite3.connect(self.db_name) as conn:
-                    queried_df = pd.read_sql_query(f"SELECT {item} FROM data", conn)
+                conn = self.connection
+                queried_df = pd.read_sql(f"SELECT {item} FROM data", conn)
                 return queried_df[item]
             else:
                 # If it's a complex column, we'd have to iterate over the chunks to aggregate the data
@@ -913,50 +1039,61 @@ class SQLDataFrameWrapper:
 
         return self._chunk_cache[chunk_file]
 
-    def _inner_query(self, sql_query):
+    def _inner_query(self, sql_query, fetch_complex = True):
 
         # Fetch the simple data portion from SQLite
-        with sqlite3.connect(self.db_name) as conn:
-            start = time.time()
-            queried_df = pd.read_sql_query(sql_query, conn)
-            end = time.time()
-            self.logger.info(f'Query for simple columns data of {len(queried_df)} took {(end - start) * 1000} ms')
+        conn = self.connection
+
+        start = time.time()
+        queried_df = pd.read_sql(sql_query, conn)
+        end = time.time()
+        self.logger.info(f'Query for simple columns data of {len(queried_df)} took {(end - start) * 1000} ms')
 
         queried_df = self._restore_types(queried_df)
         # Sort queried DataFrame by chunking_index for efficient chunk retrieval
 
         # Fetch the required chunks from the pickled files and construct the complex data portion
         required_rows = []
-
-        with tqdm.tqdm(desc = 'fetching full chunks to merge with query') as pbar:
-            for chunk_idx in queried_df.chunk_id.unique():
-                cached_chunk = self.fetch_raw_chunk(int(chunk_idx))
-                # Use cached_chunk to extract the necessary rows
-                required_rows.append(cached_chunk)
-                pbar.update(1)
-
-        self.logger.info(f'Merging results in query')
-
-        if len(required_rows) ==  0:
-            result_df = self.iloc[0:1].head(0)
+        if not fetch_complex:
+            result_df = queried_df
         else:
-            result_df = pd.concat(required_rows)
-            result_df = result_df.merge(queried_df, on = ['chunking_index', 'chunk_id'], how = 'inner', suffixes = ['_old', '_new'])
+            if len(queried_df) > 0:
+                with tqdm.tqdm(desc = 'fetching full chunks to merge with query') as pbar:
+                    for chunk_idx in queried_df['chunk_id'].unique():
+                        cached_chunk = self.fetch_raw_chunk(int(chunk_idx))
+                        # Use cached_chunk to extract the necessary rows
+                        required_rows.append(cached_chunk)
+                        pbar.update(1)
 
-            rename = {}
-            for c in result_df.columns.values:
-                if '_new' in c:
-                    rename[c] = c.replace("_new", "")
+            self.logger.info(f'Merging results in query')
 
-            result_df = result_df.rename(columns=rename)
-            result_df = result_df[[c for c in result_df.columns.values if "_old" not in c]]
+            if len(required_rows) ==  0:
+                result_df = self.iloc[0:1].head(0)
+            else:
+                result_df = pd.concat(required_rows)
+                result_df = result_df.merge(queried_df, on = ['chunking_index', 'chunk_id'], how = 'inner', suffixes = ['_old', '_new'])
 
-        self.logger.info(f'Finished merging results in query')
+                rename = {}
+                for c in result_df.columns.values:
+                    if '_new' in c:
+                        rename[c] = c.replace("_new", "")
+
+                result_df = result_df.rename(columns=rename)
+                result_df = result_df[[c for c in result_df.columns.values if "_old" not in c]]
+
+            self.logger.info(f'Finished merging results in query')
+
+        if 'chunking_index' in result_df:
+            result_df = result_df.set_index(result_df.chunking_index.values)
+
         return result_df
 
-    def query(self, query_str):
+    def query(self, query_str, start = None, stop = None):
         query_str = pandas_query_to_sqlite(query_str)
-        return self._inner_query(f"SELECT * FROM data WHERE {query_str}")
+        if start is not None and stop is not None:
+            return self._inner_query(f"SELECT * FROM data WHERE {query_str} ORDER BY chunking_index LIMIT {stop} OFFSET {start}")
+        else:
+            return self._inner_query(f"SELECT * FROM data WHERE {query_str}")
 
     @property
     def iloc(self):
@@ -992,10 +1129,11 @@ class SQLDataFrameWrapper:
 
         # Helper function to handle column selection
         def column_selection(idx):
-            with sqlite3.connect(self.database_path) as conn:
-                # Fetch column names from the database
-                cursor = conn.execute('SELECT * FROM data LIMIT 1')
-                col_names = [desc[0] for desc in cursor.description]
+            conn = self.connection
+
+            # Fetch column names from the database
+            cursor = conn.execute('SELECT * FROM data LIMIT 1')
+            col_names = [desc[0] for desc in cursor.description]
 
             if isinstance(idx, int):  # single column
                 return [col_names[idx]]
@@ -1015,8 +1153,9 @@ class SQLDataFrameWrapper:
         if col_idx is not None:
             selected_columns = ", ".join(column_selection(col_idx))
 
-        with sqlite3.connect(self.db_name) as conn:
-            simple_df = pd.read_sql_query(f"SELECT {selected_columns} FROM data WHERE {row_selection_query}", conn)
+        conn = self.connection
+
+        simple_df = pd.read_sql(f"SELECT {selected_columns} FROM data WHERE {row_selection_query}", conn)
 
         simple_df = self._restore_types(simple_df)
 
@@ -1024,7 +1163,7 @@ class SQLDataFrameWrapper:
         return self.fetch_all_for_df(simple_df)
 
 
-def generate_dataframe(n_rows=8000):
+def generate_dataframe(n_rows=200_000):
     """
     Generate a DataFrame with a given number of rows.
     Columns:
@@ -1059,6 +1198,8 @@ def generate_dataframe(n_rows=8000):
         'b': string_col,
         'd' : string_col,
         'string_col': string_col,
+        'dict_col2': dict_values,
+        'dict_col3': dict_values,
         'dict_col': dict_values,
         'float_col': float_col,
         'int_col': int_col
@@ -1079,6 +1220,8 @@ if __name__ == "__main__":
     df['extra'] = 0
     df['core_index'] = df.index.values
     wrapper = SQLDataFrameWrapper(df)
+
+    wrapper.append(df)
     print(wrapper.query("b.str.contains('date')"))
     wrapper['new_column'] = wrapper.apply(lambda x: x['b'][0:1], axis = 1)
 
@@ -1106,8 +1249,12 @@ if __name__ == "__main__":
     t['new_column3'] = [{'a' : 5}] * len(t)
     print(wrapper['new_column'].values)
 
+    start = time.time()
+    z = wrapper.loc[[3,1000,983200]]
+    end = time.time()
+    print(f'Loc took {(end - start)} ms')
 
-
+    print(wrapper.a.unique())
     print(wrapper.index.values)
     wrapper.update(t)
     print(wrapper['new_column3'].values)
