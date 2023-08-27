@@ -760,14 +760,14 @@ class SQLDataFrameWrapper:
                     os.makedirs(os.path.dirname(filename))
 
                 if os.path.exists(filename):
-                    existing_chunk = pd.read_pickle(filename, compression='gzip')
+                    existing_chunk = pd.read_pickle(filename)
                     if append:
                         new_chunk = pd.concat([existing_chunk, new_chunk])
 
                     #if not append:
                     #    raise RuntimeError(f'Trying to append a chunk to an already existing one! {filename}')
 
-                new_chunk.to_pickle(filename, compression='gzip')
+                new_chunk.to_pickle(filename)
 
     @property
     def chunk_files(self):
@@ -1034,7 +1034,7 @@ class SQLDataFrameWrapper:
             chunk_file = self.chunk_files[int(chunk_index)]
 
         if chunk_file not in self._chunk_cache:
-            cached_chunk = pd.read_pickle(chunk_file, compression='gzip')
+            cached_chunk = pd.read_pickle(chunk_file)
             self._chunk_cache[chunk_file] = cached_chunk
 
         return self._chunk_cache[chunk_file]
@@ -1091,7 +1091,7 @@ class SQLDataFrameWrapper:
     def query(self, query_str, start = None, stop = None):
         query_str = pandas_query_to_sqlite(query_str)
         if start is not None and stop is not None:
-            return self._inner_query(f"SELECT * FROM data WHERE {query_str} ORDER BY chunking_index LIMIT {stop} OFFSET {start}")
+            return self._inner_query(f"SELECT * FROM data WHERE {query_str} LIMIT {stop} OFFSET {start}")
         else:
             return self._inner_query(f"SELECT * FROM data WHERE {query_str}")
 

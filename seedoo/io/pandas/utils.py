@@ -25,7 +25,7 @@ class FileCache:
 
     def __setitem__(self, filename, value):
 
-        value.to_pickle(filename, compression='gzip')
+        value.to_pickle(filename)
         current_time = os.path.getmtime(filename)
 
         self.cache[filename] = {
@@ -62,7 +62,8 @@ class FileCache:
                 # If in-memory modified time is newer than the file's modified time
                 if data['last_modified_time'] > os.path.getmtime(filename):
                     if isinstance(data, (pd.DataFrame,)):
-                        data['data'].to_pickle(filename, compression='gzip')
+                        data['data'].to_pickle(filename)
+                        data['last_modified_time'] = os.path.getmtime(filename)
                     else:
                         with open(filename, 'wb') as file:
                             pickle.dump(data['data'], file)
