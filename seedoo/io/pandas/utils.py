@@ -24,7 +24,6 @@ class FileCache:
         return self.cache[filename]['data']
 
     def __setitem__(self, filename, value):
-
         value.to_pickle(filename)
         current_time = os.path.getmtime(filename)
 
@@ -41,10 +40,12 @@ class FileCache:
 
     def _is_file_modified(self, filename):
         if filename not in self.cache:
+            print('INVALIDTE MODIFIED')
             return True
         return os.path.getmtime(filename) > self.cache[filename]['last_modified_time']
 
     def invalidate(self, filename):
+        print(f"INVALIDATE!!: {filename}")
         if filename in self.cache:
             del self.cache[filename]
 
