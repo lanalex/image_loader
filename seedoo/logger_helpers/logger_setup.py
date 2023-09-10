@@ -111,25 +111,42 @@ class ExceptionMessageHandler(logging.StreamHandler):
         super(ExceptionMessageHandler, self).emit(record)
 
 def initialize_logger():
+    # Check if logger already has handlers (i.e., it's already initialized)
+    logger = logging.getLogger()
+    if logger.hasHandlers():
+        return logger
+
+
     LOGS_DIR = os.path.expanduser("~/seedoo_logs")
     write_to_file = bool(os.environ.get("SEEDOO_WRITE_LOGS_TO_FILE", "True"))
     log_level_str = os.environ.get("SEEDOO_LOG_LEVEL", "INFO")
     log_level = getattr(logging, log_level_str.upper(), logging.INFO)
 
-    # Get root logger
-    logger = logging.getLogger()
-
-    # Check if logger already has handlers (i.e., it's already initialized)
-    if logger.hasHandlers():
-        return logger
-
     # Create a standard log format
-    log_format = "DoLoopSeeDoo: %(asctime)s [%(levelname)s] %(name)s (%(module)s.%(filename)s:%(lineno)d): %(message)s"
+    log_format = "SeeDoo:  [%(levelname)s] %(asctime)s (%(name)s.%(funcName)s:%(lineno)d): %(message)s"
     formatter = logging.Formatter(log_format, datefmt="%Y-%m-%d %H:%M:%S")
+
+    # Check if we are in jupyter, if so we don't want to write to stdout
+    # Note we catch ONLY the import error, in case there is no ipython or jupyter installed
+    # we don't catch a generic error
+    try:
+        from IPython import get_ipython
+
+        # Determine the correct progress bar to use
+        if get_ipython() is None:
+            # Get root logger
+            stdout_handler = logging.StreamHandler(sys.stdout)
+            stdout_handler.setFormatter(formatter)
+            logger.addHandler(stdout_handler)
+    except ImportError:
+        pass
 
     syslog_address = '/var/run/syslog' if platform.system() == 'Darwin' else '/dev/log'
     syslog_handler = SysLogHandler(address=syslog_address, facility=SysLogHandler.LOG_LOCAL0)
     syslog_handler.setFormatter(formatter)
+
+
+
 
     logger.setLevel(log_level)
     logger.addHandler(syslog_handler)

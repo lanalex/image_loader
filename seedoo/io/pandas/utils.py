@@ -58,7 +58,7 @@ class FileCache:
         return self.cache.keys()
 
     def commit(self):
-        with tqdm.tqdm(total = len(self.cache), desc = 'Committng in memory chunks') as pbar:
+        with tqdm.tqdm(total = len(self.cache), desc = 'Comitting in memory chunks') as pbar:
             for filename, data in self.cache.items():
                 # If in-memory modified time is newer than the file's modified time
                 if data['last_modified_time'] > os.path.getmtime(filename):

@@ -204,7 +204,7 @@ class ImageLoader:
 
     def __str__(self):
         # Determine the correct progress bar to use
-        base64_string = self.to_base64(down_scale=0.6, quality_level=70)
+        base64_string = self.to_base64(down_scale=0.75, quality_level=95)
         return f"<image style='object-fit: cover' src='data:image/png;base64,{base64_string}'>"
 
     @classmethod

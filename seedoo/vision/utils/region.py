@@ -480,7 +480,7 @@ class Region:
 
     @staticmethod
     def highest_bbox_matches(df: pd.DataFrame, query_bbox: tuple, bbox_column: str = 'bbox', value_column = None,\
-                             bbox_list: List = None) -> pd.DataFrame:
+                             bbox_list: List = None, iou_threshold = 0.5) -> pd.DataFrame:
         """
         :param @bbox_column The name of the bbox column where each value format is [left, top, width, height] (can
         be either tuple or list)
@@ -501,14 +501,15 @@ class Region:
             df['region_column'] = df[bbox_column]
 
         if value_column is None:
-            df['iou'] = df['region_column'].apply(lambda r: r.iou(query_region))
+            df['iou'] = df['region_column'].apply(lambda r: r.min_intersect(query_region))
         else:
             df['iou'] = df[value_column]
 
 
+        iou_non_zero_values = df[df['iou'] > 0].iou.values
         iou_values = df.iou.values
-        threshold = max(iou_values.max() * 0.4, 0.00000001)
-        iou_values[iou_values <= threshold] = -1000000
+        threshold = iou_threshold
+        #iou_values[iou_values < threshold] = -10000
         sorted_indices = np.argsort(iou_values)[::-1]  # Sort in descending order
         sorted_iou_values = iou_values[sorted_indices]
 
@@ -521,15 +522,18 @@ class Region:
             second_derivative = np.gradient(gradient)
             second_derivative = np.diff(np.sign(second_derivative))
 
-            elbow_point = np.where(second_derivative != 0)[0]
+            elbow_point = np.where(second_derivative != 0)[-1]
             if len(elbow_point) == 0:
                 elbow_point = 1
             else:
                 elbow_point = elbow_point[-1] + 1
 
         elbow_point = max(elbow_point, 1)
+        if elbow_point < 5:
+            elbow_point = -1
+
         # Select the rows corresponding to the top bounding boxes up to the elbow point
-        selected_rows = df.iloc[sorted_indices[:elbow_point]]
+        selected_rows = df.iloc[sorted_indices[0:-1]]
         selected_rows = selected_rows.query("iou >= @threshold")
 
         return selected_rows
@@ -547,6 +551,7 @@ class Region:
         grouped_df = Region.group_regions_df(sorted_df, "bbox", cluster_column_name="region_group",
                                              max_relative_distance=max_relative_distance, score_column_name=score_column)
 
+        original_columns.append("region_group")
         grouped_df['region_group_score_median'] = grouped_df.groupby(['region_group'])[score_column].transform('mean')
         grouped_df['region_column'] = grouped_df['bbox'].apply(lambda x: Region.from_xywh(*x))
         #grouped_df = grouped_df[grouped_df['region_group_score_median'] >= grouped_df[score_column].max() * 0.7]
@@ -569,7 +574,7 @@ class Region:
     @staticmethod
     def group_regions_df(df: pd.DataFrame, coordinate_columns=['xmin', 'ymin', 'xmax', 'ymax'],
                          cluster_column_name: str = 'cluster_id',
-                         max_relative_distance: float = 0.1, score_column_name = None, score_tolerance = 0.85) -> pd.DataFrame:
+                         max_relative_distance: float = 0.1, score_column_name = None, score_tolerance = 0.75) -> pd.DataFrame:
 
         if len(df) == 0:
             return df

@@ -54,7 +54,7 @@ def optimized_sqlite3_connect(*args, **kwargs):
     return conn
 
 # Monkey-patch sqlite3.connect with our optimized version.
-#sqlite3.connect = optimized_sqlite3_connect
+sqlite3.connect = optimized_sqlite3_connect
 
 original_to_sql = pd.DataFrame.to_sql
 
@@ -72,12 +72,12 @@ def custom_read_sql(sql, con, index_col = None, chunk_size=100):
 
     split = 'from' if 'from' in sql else 'FROM'
     # If we want to infer the types from SQLite's table schema:
-    cur_pragma.execute(f"PRAGMA table_info({sql.split(split)[1].split()[0]})")
+    cur_pragma.execute(f"PRAGMA table_info(data)")
     type_mapping = {row[1]: row[2].lower() for row in cur_pragma.fetchall()}
     cur_pragma.close()
 
     def get_dtype(col_name):
-        sqlite_type = type_mapping[col_name]
+        sqlite_type = type_mapping.get(col_name, 'float')
         if sqlite_type in ["int", "integer", "tinyint", "smallint", "mediumint", "bigint", "unsigned big int", "int2", "int8"]:
             return "int"
         elif sqlite_type in ["real", "double", "double precision", "float"]:
@@ -173,10 +173,15 @@ def custom_to_sql(
                 # Execute the in sert with explicit column names
                 cur.executemany(f"INSERT INTO {name} ({column_names}) VALUES ({placeholders})", data)
                 logging.getLogger(__name__).info('Committing for batch')
+                cur.execute("END;")
+
                 con.commit()
                 logging.getLogger(__name__).info('Done committing for batch')
                 pbar.update(1)
         cur.close()
+
+    con.commit()
+
 
 # Monkey patch pandas DataFrame's to_sql with our custom version
 pd.DataFrame.to_sql = custom_to_sql
@@ -386,7 +391,7 @@ class SQLDataFrameWrapper:
         self.thread_executor = ThreadPoolExecutor(8)  # Initializes a thread pool executor
         self.special_types = {}
         self.logger = logging.getLogger(__name__)
-        self._connection = None
+        self._connection = {}
 
         if df is not None:
             # If append mode, fetch the max chunking_index from the DB and adjust the new df's chunking_index accordingly
@@ -398,11 +403,13 @@ class SQLDataFrameWrapper:
 
     @property
     def connection(self):
-        if self._connection is None:
-            self._connection = sqlite3.connect(self.db_name, check_same_thread=False)
-            #optimize_sqlite(self._connection)
+        thread_id = threading.get_ident()
 
-        return self._connection
+        if thread_id not in self._connection:
+            self._connection[thread_id] = sqlite3.connect(self.db_name, check_same_thread=False)
+            optimize_sqlite(self._connection[thread_id])
+
+        return self._connection[thread_id]
 
     def __len__(self):
         return self.connection.execute("select count(*) from data").fetchone()[0]
@@ -445,19 +452,20 @@ class SQLDataFrameWrapper:
 
             # Insert row_labels into a temp table
             conn = self.connection
-            temp_df.to_sql("temp_table", conn, if_exists="replace", index=False, method='multi')
+            with self.append_lock:
+                temp_df.to_sql("temp_table", conn, if_exists="replace", index=False, method='multi')
 
-            conn.execute(f"CREATE INDEX chunking_index_idx_temp_table ON temp_table (chunking_index)")
+                conn.execute(f"CREATE INDEX chunking_index_idx_temp_table ON temp_table (chunking_index)")
 
-            # Join the temp table with the main data table on chunking_index
-            query = f"""
-                SELECT {columns_query}
-                FROM data
-                JOIN temp_table ON data.chunking_index = temp_table.chunking_index
-            """
-            subset_df = pd.read_sql(query, conn)
+                # Join the temp table with the main data table on chunking_index
+                query = f"""
+                    SELECT {columns_query}
+                    FROM data
+                    JOIN temp_table ON data.chunking_index = temp_table.chunking_index
+                """
+                subset_df = pd.read_sql(query, conn)
 
-            conn.execute(f"DROP TABLE temp_table")
+                conn.execute(f"DROP TABLE temp_table")
 
         subset_df = self._restore_types(subset_df)
 
@@ -507,6 +515,7 @@ class SQLDataFrameWrapper:
                 if isinstance(df[c].values[0], (dict,)):
                     df[c] = df[c].apply(lambda x: str(x))
                     simple_cols.append(c)
+                    special_types[c] = dict
                 if isinstance(df[c].values[0], (tuple,torch.Size, list)):
                     if isinstance(df[c].values[0], (torch.Size, list)):
                         special_types[c] = tuple
@@ -536,6 +545,15 @@ class SQLDataFrameWrapper:
             'chunk_size' : self.chunk_size,
             'db_name': self.db_name
         }
+
+        for key, connection in self._connection.items():
+            connection.commit()
+            connection.close()
+
+        self._connection = {}
+
+        self.thread_executor.shutdown(wait = True)
+        self.thread_executor = ThreadPoolExecutor(4)
         return state
 
     def update(self, df, swap = False):
@@ -553,6 +571,7 @@ class SQLDataFrameWrapper:
 
         # Step 1: Identify simple and complex columns in the provided dataframe
         provided_simple_cols, provided_complex_cols, special_types = self.identify_column_types(df)
+        self.special_types.update(special_types)
 
         # Step 2: Identify new columns compared to existing data
         columns_to_use = list(set(self.simple_columns) - (set(provided_simple_cols) - set(['chunking_index'])))
@@ -563,17 +582,20 @@ class SQLDataFrameWrapper:
         # Step 3: Insert the new DataFrame into a temporary table
         self.logger.info(f'Inserting df of length {len(df)} into temp table for update')
         temp_table_name = f'temp_new_data_{str(uuid.uuid1()).replace("-", "")}'
-        conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
-        df[provided_simple_cols].to_sql(temp_table_name, conn, if_exists='replace', index=False, method='multi')
+        with self.append_lock:
+            conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
 
-        self.logger.info(f'Creating indexes for columns')
-        # Step 6: Re-add indices to the new data table
-        conn.execute(f"CREATE INDEX chunking_index_idx_{temp_table_name} ON {temp_table_name} (chunking_index)")
+            df[provided_simple_cols].to_sql(temp_table_name, conn, if_exists='replace', index=False, method='multi')
+
+            self.logger.info(f'Creating indexes for columns')
+            # Step 6: Re-add indices to the new data table
+            conn.execute(f"CREATE INDEX chunking_index_idx_{temp_table_name} ON {temp_table_name} (chunking_index)")
 
         if swap:
-            conn.execute("DROP TABLE data")
-            conn.execute(f"ALTER TABLE {temp_table_name} RENAME TO data")
-            conn.commit()
+            with self.append_lock:
+                conn.execute("DROP TABLE data")
+                conn.execute(f"ALTER TABLE {temp_table_name} RENAME TO data")
+                conn.commit()
         else:
             self.logger.info(f'Joining temp table with main table for update')
             # Step 4: Join the temp table with the main data table
@@ -588,16 +610,18 @@ class SQLDataFrameWrapper:
             # Step 5: Swap tables
             self.logger.info('Dropping data and renaming the temp table')
 
-            conn.execute("DROP TABLE data")
-            conn.execute("ALTER TABLE temp_combined_data RENAME TO data")
-            conn.execute(f"DROP TABLE {temp_table_name}")
-            conn.commit()
+            with self.append_lock:
+                conn.execute("DROP TABLE data")
+                conn.execute("ALTER TABLE temp_combined_data RENAME TO data")
+                conn.execute(f"DROP TABLE {temp_table_name}")
+                conn.commit()
 
         for col in provided_simple_cols:
             if col != 'index':
                 try:
-                    conn.execute(f"CREATE INDEX idx_{col} ON data ({col})")
-                    conn.commit()
+                    with self.append_lock:
+                        conn.execute(f"CREATE INDEX idx_{col} ON data ({col})")
+                        conn.commit()
                 except sqlite3.OperationalError as exc:
                     if "already exists" in exc.args[0]:
                         pass
@@ -615,7 +639,10 @@ class SQLDataFrameWrapper:
 
     def _update_complex_columns(self):
         chunk = self.fetch_raw_chunk(0)
-        self.complex_columns = list(chunk.columns.values)
+        simple_columns = self.simple_columns
+        self.complex_columns = list([c for c in chunk.columns.values if c not in simple_columns])
+        self.complex_columns.append('chunk_id')
+        self.complex_columns.append('chunking_index')
 
     def groupby(self, by=None, axis=0, level=None, as_index=True, sort=True,
                 group_keys=True, squeeze=None, observed=False, dropna=True):
@@ -740,7 +767,7 @@ class SQLDataFrameWrapper:
                 if chunk is None:
                     continue
 
-                df_chunk = self._fetch_chunk(i, chunk)
+                df_chunk = self.fetch_raw_chunk(chunk_file=chunk_file)
                 pbar.update(1)
                 yield df_chunk
 
@@ -755,7 +782,7 @@ class SQLDataFrameWrapper:
         self._chunk_cache = FileCache()
         self.always_commit = state.get('always_commit', False)
         self._loc_indexer = SQLDataFrameWrapper.LocIndexer(self)
-        self._connection = None
+        self._connection = {}
         self.append_lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
         self.chunk_size = state['chunk_size']
@@ -841,7 +868,7 @@ class SQLDataFrameWrapper:
                     if x not in cache:
                         cache[x] = ast.literal_eval(x)
                     return cache[x]
-                except ValueError as exc:
+                except (ValueError,SyntaxError) as exc:
                     cache[x] = x
                     return x
 
@@ -855,7 +882,7 @@ class SQLDataFrameWrapper:
         if not (set(special_columns) & set(df.columns.values)):
             return df
         else:
-            future_results = [self.thread_executor.submit(parallel_eval, df[col], col) for col in special_columns]
+            future_results = [self.thread_executor.submit(parallel_eval, df[col], col) for col in special_columns if col in special_columns]
             for future in as_completed(future_results):
                 col_data, col_name = future.result()
                 df[col_name] = col_data
@@ -901,7 +928,8 @@ class SQLDataFrameWrapper:
         df_simple = self._restore_types(df_simple)
 
         # Step 4: Drop the temporary table
-        conn.execute("DROP TABLE tmp_chunking_indices")
+        with self.append_lock:
+            conn.execute("DROP TABLE tmp_chunking_indices")
 
         _, complex_columns, _ = SQLDataFrameWrapper.identify_column_types(df_complex)
         if 'index' in df_simple:
@@ -921,8 +949,22 @@ class SQLDataFrameWrapper:
         return df_combined
 
     def drop_duplicates(self, subset = [], fetch_complex = True):
-        query = ",".join(subset)
-        query = f"select distinct {query} from data"
+        subset = ",".join(subset)
+        columns = self.simple_columns
+        if fetch_complex:
+            columns = columns + self.complex_columns
+            columns = sorted(list(set(columns)))
+
+        columns = ",".join(columns)
+
+        query = f"""SELECT {columns}
+                FROM (
+                    SELECT *,
+                           ROW_NUMBER() OVER(PARTITION BY {subset} ORDER BY chunking_index) AS rn
+                    FROM data
+                ) AS subquery
+                WHERE rn = 1;
+                """
         return self._inner_query(query, fetch_complex)
 
     def apply(self, func, axis=0, **kwargs):
@@ -976,6 +1018,14 @@ class SQLDataFrameWrapper:
                 continue
 
             # Use cached_chunk to extract the necessary rows
+            existing_complex_columns = set(cached_chunk.columns.values)
+            missing = set(self.complex_columns) - existing_complex_columns
+            if len(missing) > 0:
+                self.logger.warning(f'Cached chunk {self.chunk_files[chunk_id]} has missing columns: {list(missing)}')
+                for m in missing:
+                    cached_chunk[m] = ''
+
+            cached_chunk = cached_chunk[self.complex_columns]
             required_rows.append(cached_chunk)
 
         result_df = pd.concat(required_rows).drop_duplicates(subset=['chunking_index'])
@@ -1060,6 +1110,12 @@ class SQLDataFrameWrapper:
 
         self._chunk_cache.commit()
 
+        #for key, connection in self._connection.items():
+        #    connection.commit()
+        #    connection.close()
+
+        #self._.connection = {}
+
     def __setitem__(self, key, value):
 
         indexes = self.index.values
@@ -1121,7 +1177,8 @@ class SQLDataFrameWrapper:
         try:
             if chunk_file is None:
                 if int(chunk_index) not in self.chunk_files:
-                    print(f'BAD CHUNK: {chunk_index} and chunk_files is: {self.chunk_files}')
+                    self.logger.warn(f'BAD CHUNK: {chunk_index} and total chunk_files {len(self.chunk_files)}')
+                    return None
 
                 chunk_file = self.chunk_files[int(chunk_index)]
 
@@ -1139,13 +1196,13 @@ class SQLDataFrameWrapper:
 
                 clean = cached_chunk.drop_duplicates(subset = ['chunking_index', 'chunk_id'])
                 if len(clean) < len(cached_chunk):
-                    print(f'WARNING: Chunk file contained duplicates! {len(clean)} vs {len(cached_chunk)})')
+                    self.logger.warning(f'WARNING: Chunk file contained duplicates! {len(clean)} vs {len(cached_chunk)})')
 
                 self._chunk_cache[chunk_file] = clean
 
             return self._chunk_cache[chunk_file]
         except EOFError as exc:
-            print("BAD FILE")
+            self.logger.error(f"BAD CHUNK FILE DETECTED , chunked index: {chunk_index}")
             return None
 
     def _inner_query(self, sql_query, fetch_complex = True):
@@ -1280,7 +1337,7 @@ class SQLDataFrameWrapper:
         return self.fetch_all_for_df(simple_df)
 
 
-def generate_dataframe(n_rows=200_000):
+def generate_dataframe(n_rows=20_000):
     """
     Generate a DataFrame with a given number of rows.
     Columns:
@@ -1364,6 +1421,7 @@ if __name__ == "__main__":
     z = wrapper.groupby(['string_col'], group_keys = True, as_index = False).parallel_apply(test)
     with open("./pickle_test.pickle", "wb") as f:
         pickle.dump(wrapper, f)
+
 
     with open("./pickle_test.pickle", "rb") as f:
         wrapper = pickle.load(f)
