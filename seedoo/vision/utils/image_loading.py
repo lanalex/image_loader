@@ -13,7 +13,7 @@ import tempfile
 import boto3
 import os
 import urllib
-
+import logging
 import cv2
 import hashlib
 from io import BytesIO
@@ -26,6 +26,62 @@ except ImportError:
         raise
     else:
         pass
+
+
+def create_error_image_cv2(message = ''):
+    try:
+        global cached_error_message
+
+        # An exception means we haven't set the cached image yet
+        # its better to check an exception (happens once) rather then in globals() which is faster per call but will
+        # happen every CALL so ammoritized it is slower and an exception catch is better
+        try:
+            result = cached_error_message
+        except (AttributeError, NameError) as exc:
+            # Create a new image with a black background
+            width, height = 256, 256
+            image = np.zeros((height, width, 3), dtype=np.uint8)
+
+            # Choose font
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            font_thickness = 1
+            text_color = (255, 255, 255)  # White color
+
+            text = f"Url err, {message}"
+            (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, font_thickness)
+
+            # Calculate the position to center the text
+            x = (width - text_width) // 2
+            y = (height + text_height) // 2
+
+            # Overlay the text on the image
+            cv2.putText(image, text, (x, y), font, font_scale, text_color, font_thickness, lineType=cv2.LINE_AA)
+
+            # Draw error circle
+            circle_radius = min(width, height) // 6  # Adjust this as needed
+            circle_center = (width // 2, height // 2 + text_height * 2 + circle_radius)
+
+            cv2.circle(image, circle_center, circle_radius, (0, 0, 255), 2)  # Red color
+
+            # Draw a line inside the circle to represent error
+            start_point = (circle_center[0] - circle_radius // 2, circle_center[1] - circle_radius // 2)
+            end_point = (circle_center[0] + circle_radius // 2, circle_center[1] + circle_radius // 2)
+            cv2.line(image, start_point, end_point, (0, 0, 255), 2)
+
+            start_point = (circle_center[0] - circle_radius // 2, circle_center[1] + circle_radius // 2)
+            end_point = (circle_center[0] + circle_radius // 2, circle_center[1] - circle_radius // 2)
+            cv2.line(image, start_point, end_point, (0, 0, 255), 2)
+
+            cached_error_message = Image.fromarray(image[..., ::-1])
+            result = cached_error_message
+
+        return result
+    except Exception as exc:
+        logging.getLogger(__name__).exception('Error in generating error image on failure of fetching original, this is a really bad situation')
+        raise
+
+
 
 def read_heic_as_bgr(heic_path):
     # Read the HEIC file using pyheif
@@ -99,7 +155,6 @@ class ImageLoader:
 
         # Retrieve the caching directory from the environment variable
         self.caching_dir = os.getenv("IMAGE_CACHE_DIR", os.path.expanduser("~/temp_images_cache"))
-
         if not path and image is not None:
             if always_in_memory:
                 self.__image = image
@@ -119,14 +174,23 @@ class ImageLoader:
 
         elif self.callback is None and path.startswith('s3://'):
             self.callback = lambda: self.download_from_s3(path)
-        elif self.callback is None and path.startswith('http://'):
-            self.callback = lambda: self.download_from_url(path)
+        elif self.callback is None and (path.startswith('http://') or path.startswith('https://')):
+            self.callback = lambda: self.download_image_from_url(path)
 
     def download_image_from_url(self, url):
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as f:
-            image = Image.open(f).convert("RGB")
-        return np.array(image)[...,[2,1,0]]
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=1.5) as f:
+                image = Image.open(f).convert("RGB")
+        except:
+            print('ERROR')
+            image = create_error_image_cv2()
+
+        image = np.array(image)[...,[2,1,0]]
+        self.save_to_temp(image)
+        return image
+
+
 
     @classmethod
     def from_callable(cls, callable, *args, **kwargs):

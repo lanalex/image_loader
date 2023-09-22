@@ -37,10 +37,17 @@ def set_pragmas_for_conn(conn):
     cur = conn.cursor()
     cur.execute("PRAGMA page_size;")
     page_size = cur.fetchone()[0]
-    desired_cache_size_bytes = 500 * 1024 ** 2
+    desired_cache_size_bytes = 5 * 1024 ** 3
 
     cur.execute("PRAGMA journal_mode=WAL;")
-    cur.execute("PRAGMA wal_autocheckpoint = 5000;")
+    cur.execute("PRAGMA wal_autocheckpoint = 500;")
+
+    # Calculate the number of pages required for the desired cache size
+    num_pages = desired_cache_size_bytes // page_size
+
+    # Set the cache size
+    cur.execute(f"PRAGMA cache_size={num_pages};")
+
 
     conn.execute("PRAGMA synchronous=NORMAL;")
     mmap_size = desired_cache_size_bytes  # Setting it to the same size as the cache for simplicity
@@ -59,7 +66,8 @@ sqlite3.connect = optimized_sqlite3_connect
 original_to_sql = pd.DataFrame.to_sql
 
 
-def custom_read_sql(sql, con, index_col = None, chunk_size=100):
+def custom_read_sql(sql, con, index_col = None, chunk_size=10000):
+    logger = logging.getLogger(__name__)
     # Create a cursor from the connection
     cur = con.cursor()
 
@@ -104,11 +112,13 @@ def custom_read_sql(sql, con, index_col = None, chunk_size=100):
             dfs.append(n)
             pbar.update(len(data_chunk))
 
+    logger.info('finished fetching rows, building result data frame')
     cur.close()
     if len(dfs) == 0:
         return pd.DataFrame([], columns=columns).astype(dtypes)
 
     df = pd.DataFrame(np.concatenate(dfs, axis = 0), columns = columns).astype(dtypes)
+    logger.info('finished building result dataframe')
     return df
 
 
@@ -280,7 +290,7 @@ class DataFrameGroupByWrapper:
         return pd.concat(results, axis=0)
 
 
-def optimize_sqlite(conn, desired_cache_size_gb=8):
+def optimize_sqlite(conn, desired_cache_size_gb=15):
     # Convert desired cache size from GB to bytes
     desired_cache_size_bytes = desired_cache_size_gb * 1024 ** 3
 
@@ -403,7 +413,7 @@ class SQLDataFrameWrapper:
 
     @property
     def connection(self):
-        thread_id = threading.get_ident()
+        thread_id =  threading.get_ident() % 3
 
         if thread_id not in self._connection:
             self._connection[thread_id] = sqlite3.connect(self.db_name, check_same_thread=False)
@@ -501,27 +511,45 @@ class SQLDataFrameWrapper:
             else:
                 return i
 
+        index = 0
         for c in df.columns.values:
             # Check for numeric types and adjust data types if needed
-            if isinstance(df[c].values[0], (str, float, int, np.float32, np.int32, np.float64, np.int64, bool, np.bool_)):
+            while True:
+                val = df[c].values[index]
+                if isinstance(val, (np.ndarray, pd.DataFrame)):
+                    break
+                elif isinstance(val, type(None)) or \
+                                   (not isinstance(val, (np.ndarray, pd.DataFrame, list, dict)) and pd.isnull(val)):
+                    index +=1
+                    continue
+                else:
+                    break
+
+
+            if isinstance(df[c].values[index], (str, float, int, np.float32, np.int32, np.float64, np.int64, bool, np.bool_)):
                 simple_cols.append(c)
-                if isinstance(df[c].values[0], (np.bool_, bool,)):
+                if isinstance(df[c].values[index], (np.bool_, bool,)):
                     df[c] = df[c].apply(lambda x: bool(x))
-                elif isinstance(df[c].values[0], np.int64):
+                elif isinstance(df[c].values[index], np.int64):
                     df[c] = df[c].astype(np.int32)
-                elif isinstance(df[c].values[0], np.float64):
+                elif isinstance(df[c].values[index], np.float64):
                     df[c] = df[c].astype(np.float32)
             else:
-                if isinstance(df[c].values[0], (dict,)):
+
+                if isinstance(df[c].values[index], (np.ndarray,)):
+                    df[c] = df[c].apply(lambda x: x.tolist())
+
+
+                if isinstance(df[c].values[index], (dict,)):
                     df[c] = df[c].apply(lambda x: str(x))
                     simple_cols.append(c)
                     special_types[c] = dict
-                if isinstance(df[c].values[0], (tuple,torch.Size, list)):
-                    if isinstance(df[c].values[0], (torch.Size, list)):
-                        special_types[c] = tuple
-                        df[c] = df[c].apply(lambda x: str(tuple(x)))
+                if isinstance(df[c].values[index], (tuple,torch.Size, list)):
+                    if isinstance(df[c].values[index], (torch.Size, list)):
+                        special_types[c] = type(df[c].values[index])
+                        df[c] = df[c].apply(lambda x: str(tuple(x)) if isinstance(x, torch.Size) else str(x))
                     else:
-                        special_types[c] = type(df[c].values[0])
+                        special_types[c] = type(df[c].values[index])
                         df[c] = df[c].apply(lambda x: str(x))
                     simple_cols.append(c)
                 else:
@@ -530,10 +558,16 @@ class SQLDataFrameWrapper:
         complex_cols.append("chunk_id")
         complex_cols.append("chunking_index")
 
-        if 'chunk_id' not in simple_cols:
-            simple_cols.append("chunk_id")
+        simple_cols = set(simple_cols)
+        complex_cols = set(complex_cols)
 
-        return list(set(simple_cols)), list(set(complex_cols)), special_types
+        overlap = simple_cols & (complex_cols - set(['chunk_id', 'chunking_index']))
+        if len(overlap) > 0:
+            logging.getLogger(__name__).warning(f'We have overlap of complex and simple columns: {overlap} removing the overlap from the complex columns')
+            complex_cols = complex_cols - overlap
+
+
+        return list(simple_cols), list(complex_cols), special_types
 
     def __getstate__(self):
         state = {
@@ -574,9 +608,9 @@ class SQLDataFrameWrapper:
         self.special_types.update(special_types)
 
         # Step 2: Identify new columns compared to existing data
-        columns_to_use = list(set(self.simple_columns) - (set(provided_simple_cols) - set(['chunking_index'])))
+        columns_to_use = list(set(self.simple_columns) - (set(provided_simple_cols) - set(['chunking_index', 'chunk_id'])))
         columns_to_use = ", ".join([f"a.{col} as {col}" for col in columns_to_use])
-        columns_to_add_or_update = ", ".join([f"b.{col} as {col}" for col in provided_simple_cols if col != 'chunking_index'])
+        columns_to_add_or_update = ", ".join([f"b.{col} as {col}" for col in provided_simple_cols if col != 'chunking_index' and col != 'chunk_id'])
 
         conn = self.connection
         # Step 3: Insert the new DataFrame into a temporary table
@@ -587,9 +621,10 @@ class SQLDataFrameWrapper:
 
             df[provided_simple_cols].to_sql(temp_table_name, conn, if_exists='replace', index=False, method='multi')
 
-            self.logger.info(f'Creating indexes for columns')
+            self.logger.info(f'Creating index for temp table on bulk insert')
             # Step 6: Re-add indices to the new data table
             conn.execute(f"CREATE INDEX chunking_index_idx_{temp_table_name} ON {temp_table_name} (chunking_index)")
+            self.logger.info(f'Done creating index for temp table on bulk insert')
 
         if swap:
             with self.append_lock:
@@ -616,17 +651,23 @@ class SQLDataFrameWrapper:
                 conn.execute(f"DROP TABLE {temp_table_name}")
                 conn.commit()
 
+        self.logger.info(f'Creating indexexes for simple columns, except those in special types')
         for col in provided_simple_cols:
-            if col != 'index':
+            if col != 'index' and col not in self.special_types:
                 try:
+                    self.logger.info(f'Creating index for {col}')
                     with self.append_lock:
                         conn.execute(f"CREATE INDEX idx_{col} ON data ({col})")
                         conn.commit()
+                    self.logger.info(f'Done creating index for {col}')
+
                 except sqlite3.OperationalError as exc:
                     if "already exists" in exc.args[0]:
                         pass
                     else:
                         raise
+
+        self.logger.info(f'Done creating indexexes for simple columns, except those in special types')
 
         self.logger.info('Creating indexes')
         remaining_complex_columns = set(provided_complex_cols) - set(["chunking_index", "chunk_id"])
@@ -856,13 +897,23 @@ class SQLDataFrameWrapper:
     def _restore_types(self, df):
 
         cache = {}
-        def parallel_eval(column_data, col):
+        def parallel_eval(column_data, col, special_types):
             import ast
             nonlocal cache
             def safe_eval(x):
                 nonlocal  cache
                 try:
-                    if isinstance(x, (torch.Size)):
+                    if x == 'nan' or x == 'None':
+                        if special_types[col] == list:
+                            x = []
+                        elif special_types[col] == dict:
+                            x = {}
+                        elif special_types[col] == tuple:
+                            x = tuple([])
+
+                        return
+
+                    if isinstance(x, (torch.Size,)):
                         return tuple(x)
 
                     if x not in cache:
@@ -882,7 +933,7 @@ class SQLDataFrameWrapper:
         if not (set(special_columns) & set(df.columns.values)):
             return df
         else:
-            future_results = [self.thread_executor.submit(parallel_eval, df[col], col) for col in special_columns if col in special_columns]
+            future_results = [self.thread_executor.submit(parallel_eval, df[col], col, special_types) for col in special_columns if col in special_columns]
             for future in as_completed(future_results):
                 col_data, col_name = future.result()
                 df[col_name] = col_data
@@ -1143,7 +1194,9 @@ class SQLDataFrameWrapper:
         existing_column_names = [col[1] for col in existing_columns]
 
         # Exclude 'chunking_index' and 'index'
-        return [col for col in existing_column_names if col not in ['index']]
+        simple_columns = [col for col in existing_column_names if col not in ['index']]
+
+        return simple_columns
 
     def __getattr__(self, attr):
         if attr in self.__dict__:
@@ -1262,12 +1315,12 @@ class SQLDataFrameWrapper:
         self.logger.info(f'Finished index to df')
         return result_df
 
-    def query(self, query_str, start = None, stop = None):
+    def query(self, query_str, start = None, stop = None, from_clause = "*", extra = "", with_complex = True):
         query_str = pandas_query_to_sqlite(query_str)
         if start is not None and stop is not None:
-            return self._inner_query(f"SELECT * FROM data WHERE {query_str} LIMIT {stop} OFFSET {start}")
+            return self._inner_query(f"SELECT {from_clause} FROM data WHERE {query_str}  {extra} LIMIT {stop} OFFSET {start}", with_complex)
         else:
-            return self._inner_query(f"SELECT * FROM data WHERE {query_str}")
+            return self._inner_query(f"SELECT {from_clause} FROM data WHERE {query_str} {extra}", with_complex)
 
     @property
     def iloc(self):

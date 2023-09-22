@@ -695,9 +695,11 @@ class Region:
             if 'label' in current_region.meta_data:
                 label = current_region.meta_data['label']
 
-            unique_labels.add(label)
+            if isinstance(label, str):
+                unique_labels.add(label)
 
-        label_to_color = assign_colors(list(unique_labels))
+        if len(unique_labels) > 0:
+            label_to_color = assign_colors(list(unique_labels))
 
         for current_region, label, current_color, font in zip(regions, labels, colors, fonts):
             color = None
@@ -724,7 +726,7 @@ class Region:
                 if v:
                     final_label = f"{v}"
                     label_width, label_height = cv2.getTextSize(final_label, font, 0.8, thickness)[0]
-                    image = cv2.putText(image, final_label, (current_region.column + current_region.width + 10, current_region.row - 10 + offset + label_height), font, 0.3, color, thickness)
+                    image = cv2.putText(image, final_label, (current_region.column + current_region.width // 2 - label_width, current_region.row - 10 + offset + label_height), font, 0.3, color, thickness)
                     offset += label_height + 20
 
 

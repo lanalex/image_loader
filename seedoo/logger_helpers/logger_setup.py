@@ -146,22 +146,20 @@ def initialize_logger():
     syslog_handler.setFormatter(formatter)
 
 
-
-
     logger.setLevel(log_level)
     logger.addHandler(syslog_handler)
 
     # Exception Handler for stdout - only exception messages, no stack trace
-    exception_handler_stdout = ExceptionMessageHandler(sys.stdout)
-    exception_handler_stdout.setLevel(logging.ERROR)
-    exception_handler_stdout.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(exception_handler_stdout)
+    #exception_handler_stdout = ExceptionMessageHandler(sys.stdout)
+    #exception_handler_stdout.setLevel(logging.ERROR)
+    #exception_handler_stdout.setFormatter(logging.Formatter("%(message)s"))
+    #logger.addHandler(exception_handler_stdout)
 
     # Exception Handler for stderr - only exception messages, no stack trace
-    exception_handler_stderr = ExceptionMessageHandler(sys.stderr)
-    exception_handler_stderr.setLevel(logging.ERROR)
-    exception_handler_stderr.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(exception_handler_stderr)
+    #exception_handler_stderr = ExceptionMessageHandler(sys.stderr)
+    #exception_handler_stderr.setLevel(logging.ERROR)
+    #exception_handler_stderr.setFormatter(logging.Formatter("%(message)s"))
+    #logger.addHandler(exception_handler_stderr)
 
     # If the write_to_file flag is set, add file handlers
     if write_to_file:

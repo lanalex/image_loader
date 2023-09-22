@@ -9,11 +9,15 @@ def pandas():
     from seedoo.io.pandas.lazy import LazyDataFrame
     import pandas as pd
 
-    def to_html_wrapper(self, perform_display = True, index = True):
+    def to_html_wrapper(self, perform_display = True, index = False):
 
         from IPython.display import HTML, display
         columns = self.columns.values.tolist()
-        html = self.to_html(escape=False, index = index)
+        for c in columns:
+            if isinstance(self[c].values[0], pd.DataFrame):
+                self[c] = self[c].apply(lambda x: x.render(perform_display=False, index = False))
+
+        html = self.to_html(escape=False, index = index).replace("\n", "")
         css_style = """
         <style>
             div.df_container {
@@ -37,7 +41,7 @@ def pandas():
         if perform_display:
             display(HTML(html))
         else:
-            return html
+            return html.replace("\n", "")
 
     DataFrame.render = to_html_wrapper
 
