@@ -17,6 +17,7 @@ import pickle
 import numpy as np
 import re
 import inspect
+import dill
 import asyncio
 import threading
 import tqdm
@@ -37,7 +38,7 @@ def set_pragmas_for_conn(conn):
     cur = conn.cursor()
     cur.execute("PRAGMA page_size;")
     page_size = cur.fetchone()[0]
-    desired_cache_size_bytes = 5 * 1024 ** 3
+    desired_cache_size_bytes = 30 * 1024 ** 3
 
     cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("PRAGMA wal_autocheckpoint = 500;")
@@ -66,7 +67,7 @@ sqlite3.connect = optimized_sqlite3_connect
 original_to_sql = pd.DataFrame.to_sql
 
 
-def custom_read_sql(sql, con, index_col = None, chunk_size=10000):
+def custom_read_sql(sql, con, index_col = None, chunk_size=500):
     logger = logging.getLogger(__name__)
     # Create a cursor from the connection
     cur = con.cursor()
@@ -102,15 +103,15 @@ def custom_read_sql(sql, con, index_col = None, chunk_size=10000):
 
     dfs = []
 
-    with tqdm.tqdm(desc="Fetching rows") as pbar:
-        while True:
-            data_chunk = cur.fetchmany(chunk_size)
-            if not data_chunk:
-                break
+    #with tqdm.tqdm(desc="Fetching rows") as pbar:
+    while True:
+        data_chunk = cur.fetchmany(chunk_size)
+        if not data_chunk:
+            break
 
-            n = np.array(data_chunk)
-            dfs.append(n)
-            pbar.update(len(data_chunk))
+        n = np.array(data_chunk)
+        dfs.append(n)
+    #pbar.update(len(data_chunk))
 
     logger.info('finished fetching rows, building result data frame')
     cur.close()
@@ -290,7 +291,7 @@ class DataFrameGroupByWrapper:
         return pd.concat(results, axis=0)
 
 
-def optimize_sqlite(conn, desired_cache_size_gb=15):
+def optimize_sqlite(conn, desired_cache_size_gb=30):
     # Convert desired cache size from GB to bytes
     desired_cache_size_bytes = desired_cache_size_gb * 1024 ** 3
 
@@ -324,6 +325,8 @@ class SQLDataFrameWrapper:
     class LocIndexer:
         def __init__(self, wrapper):
             self.wrapper = wrapper
+        def __setitem__(self, *args):
+            print(args)
 
         def __getitem__(self, idx):
             # If idx is a slice, it's equivalent to df.loc[start:stop]
@@ -387,7 +390,7 @@ class SQLDataFrameWrapper:
                 col_idx = None
                 return self.wrapper._iloc_method(row_idx, col_idx)
 
-    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 500):
+    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 1024):
         self.db_name = os.path.join(path, db_name)
         self.complex_columns = []
         self._chunk_cache = FileCache()
@@ -499,6 +502,7 @@ class SQLDataFrameWrapper:
         - tuple of two lists: (simple_columns, complex_columns)
         """
 
+        logger = logging.getLogger(__name__)
         simple_cols = []
         complex_cols = []
         special_types = {}
@@ -511,20 +515,30 @@ class SQLDataFrameWrapper:
             else:
                 return i
 
-        index = 0
-        for c in df.columns.values:
-            # Check for numeric types and adjust data types if needed
-            while True:
-                val = df[c].values[index]
-                if isinstance(val, (np.ndarray, pd.DataFrame)):
-                    break
-                elif isinstance(val, type(None)) or \
-                                   (not isinstance(val, (np.ndarray, pd.DataFrame, list, dict)) and pd.isnull(val)):
-                    index +=1
-                    continue
-                else:
-                    break
 
+        for c in df.columns.values:
+            index = 0
+            # Check for numeric types and adjust data types if needed
+            while index < len(df):
+                try:
+                    val = df[c].values[index]
+                    if isinstance(val, (np.ndarray, pd.DataFrame)):
+                        break
+                    elif isinstance(val, type(None)) or \
+                                       (not isinstance(val, (np.ndarray, pd.DataFrame, list, dict)) and pd.isnull(val)):
+                        index +=1
+                        continue
+                    else:
+                        break
+                except Exception as exc:
+                    logger.error(f'Error while evaluating type of column: {c}')
+                    raise
+
+
+            if index >= len(df):
+                df[c].fillna('', inplace=True)
+                simple_cols.append(c)
+                continue
 
             if isinstance(df[c].values[index], (str, float, int, np.float32, np.int32, np.float64, np.int64, bool, np.bool_)):
                 simple_cols.append(c)
@@ -537,7 +551,7 @@ class SQLDataFrameWrapper:
             else:
 
                 if isinstance(df[c].values[index], (np.ndarray,)):
-                    df[c] = df[c].apply(lambda x: x.tolist())
+                    df[c] = df[c].apply(lambda x: x.tolist() if isinstance(x, np.ndarray) else [0])
 
 
                 if isinstance(df[c].values[index], (dict,)):
@@ -841,7 +855,8 @@ class SQLDataFrameWrapper:
             # Save simple columns to SQLite
             conn = self.connection
             if append:
-                simple_columns_df = simple_columns_df[self.simple_columns]
+                simple_columns = list(set(simple_columns_df.columns.values) & set(self.simple_columns))
+                simple_columns_df = simple_columns_df[simple_columns]
                 simple_columns_df.to_sql("data", conn, index=True, if_exists="append")
             else:
                 simple_columns_df.to_sql("data", conn, index=True, if_exists="replace")
@@ -863,7 +878,8 @@ class SQLDataFrameWrapper:
                     os.makedirs(os.path.dirname(filename))
 
                 if os.path.exists(filename):
-                    existing_chunk = pd.read_pickle(filename)
+                    with open(filename, "rb") as f:
+                        existing_chunk = dill.load(f)
                     if append:
                         new_chunk = pd.concat([existing_chunk, new_chunk])
                         new_chunk = new_chunk.drop_duplicates(subset = ['chunk_id', 'chunking_index'])
@@ -895,7 +911,6 @@ class SQLDataFrameWrapper:
 
 
     def _restore_types(self, df):
-
         cache = {}
         def parallel_eval(column_data, col, special_types):
             import ast
@@ -923,7 +938,7 @@ class SQLDataFrameWrapper:
                     cache[x] = x
                     return x
 
-            return column_data.progress_apply(safe_eval), col
+            return column_data.apply(safe_eval), col
 
         special_types = self.special_types
         if len(special_types) == 0 or len(df) == 0:
@@ -933,7 +948,7 @@ class SQLDataFrameWrapper:
         if not (set(special_columns) & set(df.columns.values)):
             return df
         else:
-            future_results = [self.thread_executor.submit(parallel_eval, df[col], col, special_types) for col in special_columns if col in special_columns]
+            future_results = [self.thread_executor.submit(parallel_eval, df[col], col, special_types) for col in special_columns if col in df]
             for future in as_completed(future_results):
                 col_data, col_name = future.result()
                 df[col_name] = col_data
@@ -1079,8 +1094,12 @@ class SQLDataFrameWrapper:
             cached_chunk = cached_chunk[self.complex_columns]
             required_rows.append(cached_chunk)
 
-        result_df = pd.concat(required_rows).drop_duplicates(subset=['chunking_index'])
-        result_df = result_df.merge(simple_df[self.simple_columns], on = ['chunking_index', 'chunk_id'])
+        if len(required_rows) > 0:
+            result_df = pd.concat(required_rows).drop_duplicates(subset=['chunking_index'])
+            result_df = result_df.merge(simple_df[self.simple_columns], on = ['chunking_index', 'chunk_id'])
+        else:
+            result_df = simple_df[self.simple_columns]
+
         return result_df
 
     def _preload_all_chunks(self):
@@ -1236,7 +1255,8 @@ class SQLDataFrameWrapper:
                 chunk_file = self.chunk_files[int(chunk_index)]
 
             if chunk_file not in self._chunk_cache:
-                cached_chunk = pd.read_pickle(chunk_file)
+                with open(chunk_file, "rb") as f:
+                    cached_chunk = dill.load(f)
 
                 had_fixes = False
                 for c in cached_chunk.columns.values:
@@ -1461,6 +1481,7 @@ if __name__ == "__main__":
     wrapper.append(df[wrapper.simple_columns])
     print(wrapper.query("b.str.contains('date')"))
     wrapper['new_column'] = wrapper.apply(lambda x: x['b'][0:1], axis = 1)
+    wrapper.loc[10, 'new_column2'] = 0
 
 
     for d in wrapper.chunked_dataframes():

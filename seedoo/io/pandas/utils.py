@@ -3,6 +3,7 @@ import time
 import pickle
 import pandas as pd
 import tqdm
+import dill
 
 class FileCache:
     def __init__(self):
@@ -24,7 +25,9 @@ class FileCache:
         return self.cache[filename]['data']
 
     def __setitem__(self, filename, value):
-        value.to_pickle(filename)
+        with open(filename, "wb") as f:
+            dill.dump(value, f)
+
         current_time = os.path.getmtime(filename)
 
         self.cache[filename] = {
@@ -63,11 +66,12 @@ class FileCache:
                 # If in-memory modified time is newer than the file's modified time
                 if data['last_modified_time'] > os.path.getmtime(filename):
                     if isinstance(data, (pd.DataFrame,)):
-                        data['data'].to_pickle(filename)
+                        with open(filename, "wb") as f:
+                            dill.dump(data['data'], f)
                         data['last_modified_time'] = os.path.getmtime(filename)
                     else:
                         with open(filename, 'wb') as file:
-                            pickle.dump(data['data'], file)
+                            dill.dump(data['data'], file)
                         os.utime(filename, (data['last_access_time'], data['last_modified_time']))
                 pbar.update(1)
 
