@@ -38,11 +38,13 @@ def set_pragmas_for_conn(conn):
     cur = conn.cursor()
     cur.execute("PRAGMA page_size;")
     page_size = cur.fetchone()[0]
-    desired_cache_size_bytes = 30 * 1024 ** 3
+    desired_cache_size_bytes = 5 * (1024 ** 3)
+
 
     cur.execute("PRAGMA journal_mode=WAL;")
-    cur.execute("PRAGMA wal_autocheckpoint = 500;")
-
+    cur.execute("PRAGMA temp_store = MEMORY;")  # Use memory for temporary tables and indices
+    cur.execute("PRAGMA foreign_keys=OFF;")  # Turn off foreign key constraints (if you're sure you don't need them)
+    cur.execute("PRAGMA wal_autocheckpoint=1000000;")  # Increase WAL checkpoint interval
     # Calculate the number of pages required for the desired cache size
     num_pages = desired_cache_size_bytes // page_size
 
@@ -50,7 +52,7 @@ def set_pragmas_for_conn(conn):
     cur.execute(f"PRAGMA cache_size={num_pages};")
 
 
-    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA synchronous=OFF;")
     mmap_size = desired_cache_size_bytes  # Setting it to the same size as the cache for simplicity
     cur.execute(f"PRAGMA mmap_size={mmap_size};")
     cur.close()
@@ -67,7 +69,7 @@ sqlite3.connect = optimized_sqlite3_connect
 original_to_sql = pd.DataFrame.to_sql
 
 
-def custom_read_sql(sql, con, index_col = None, chunk_size=500):
+def custom_read_sql(sql, con, index_col = None, chunk_size=5000):
     logger = logging.getLogger(__name__)
     # Create a cursor from the connection
     cur = con.cursor()
@@ -160,37 +162,40 @@ def custom_to_sql(
         df = df.iloc[1:]
         if_exists = 'append'  # Switch to 'append' mode for the remaining rows
         end = time.time()
-        logger.info(f'Finished insert with to_sql, it took: {(end - start) * 1000} ms')
+        logger.debug(f'Finished insert with to_sql, it took: {(end - start) * 1000} ms')
 
 
     # Create a connection and cursor
     if if_exists == 'append':
         cur = con.cursor()
         # Calculate chunk size, if not provided
-        chunksize = chunksize or 100_000
+        chunksize = chunksize or 20000
         column_names = ", ".join([f'{col}' for col in df.columns])
         # Prepare the placeholders
         num_columns = len(df.columns)
         placeholders = ", ".join(["?"] * num_columns)
+        logger = logging.getLogger(__name__)
+        #cur.execute("BEGIN;")
+        logger.debug(f'Starting inserting for df length {len(df)} and num columns: {len(df.columns.unique())}')
 
-        with tqdm.tqdm(total = int(len(df) // chunksize) + 1, desc = 'SQLLite batch insert') as pbar:
+        with tqdm.tqdm(total = len(df), desc = f'SQLLite batch insert for df of length: {len(df)}, chunk_size: {chunksize}') as pbar:
             for start in range(0, len(df), chunksize):
                 end = start + chunksize
                 batch = df.iloc[start:end]
                 # Extract column names from the DataFrame
                 data = [tuple(row) for row in batch.values]
 
-                cur.execute("BEGIN;")
                 # Execute the in sert with explicit column names
+                s = time.time()
                 cur.executemany(f"INSERT INTO {name} ({column_names}) VALUES ({placeholders})", data)
-                logging.getLogger(__name__).info('Committing for batch')
-                cur.execute("END;")
+                e = time.time()
+                logger.debug(f'Finished inserting: {(e -s) * 1000} ms')
+                pbar.update(len(batch))
+        logger.debug('Committing for batch')
+        #cur.execute("END;")
+        logger.debug('Done committing for batch')
 
-                con.commit()
-                logging.getLogger(__name__).info('Done committing for batch')
-                pbar.update(1)
         cur.close()
-
     con.commit()
 
 
@@ -291,14 +296,15 @@ class DataFrameGroupByWrapper:
         return pd.concat(results, axis=0)
 
 
-def optimize_sqlite(conn, desired_cache_size_gb=30):
+def optimize_sqlite(conn, desired_cache_size_gb=5):
     # Convert desired cache size from GB to bytes
     desired_cache_size_bytes = desired_cache_size_gb * 1024 ** 3
 
     # Connect to the SQLite database
     cur = conn.cursor()
-
+    cur.execute(f"PRAGMA page_size={1024 * 1024 * 10};")
     # Get the page size
+
     cur.execute("PRAGMA page_size;")
     page_size = cur.fetchone()[0]
 
@@ -310,11 +316,14 @@ def optimize_sqlite(conn, desired_cache_size_gb=30):
 
     # Set other performance enhancing pragmas
     cur.execute("PRAGMA journal_mode=WAL;")
-    cur.execute("PRAGMA synchronous=NORMAL;")
+    cur.execute("PRAGMA synchronous=OFF;")
 
     # Set memory-mapped I/O size
     mmap_size = desired_cache_size_bytes  # Setting it to the same size as the cache for simplicity
     cur.execute(f"PRAGMA mmap_size={mmap_size};")
+    cur.execute("PRAGMA temp_store = MEMORY;")  # Use memory for temporary tables and indices
+    cur.execute("PRAGMA foreign_keys=OFF;")  # Turn off foreign key constraints (if you're sure you don't need them)
+    cur.execute("PRAGMA wal_autocheckpoint=1000000;")  # Increase WAL checkpoint interval
 
     cur.close()
     # Commit changes and close the connection
@@ -390,7 +399,7 @@ class SQLDataFrameWrapper:
                 col_idx = None
                 return self.wrapper._iloc_method(row_idx, col_idx)
 
-    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 1024):
+    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 100):
         self.db_name = os.path.join(path, db_name)
         self.complex_columns = []
         self._chunk_cache = FileCache()
@@ -401,7 +410,7 @@ class SQLDataFrameWrapper:
         self._iloc_indexer = SQLDataFrameWrapper.IlocIndexer(self)
         self.append_lock = threading.Lock()
         self._loc_indexer = SQLDataFrameWrapper.LocIndexer(self)
-        self.thread_executor = ThreadPoolExecutor(8)  # Initializes a thread pool executor
+        self.thread_executor = ThreadPoolExecutor(2)  # Initializes a thread pool executor
         self.special_types = {}
         self.logger = logging.getLogger(__name__)
         self._connection = {}
@@ -416,7 +425,7 @@ class SQLDataFrameWrapper:
 
     @property
     def connection(self):
-        thread_id =  threading.get_ident() % 3
+        thread_id =  threading.get_ident() % 8
 
         if thread_id not in self._connection:
             self._connection[thread_id] = sqlite3.connect(self.db_name, check_same_thread=False)
@@ -577,7 +586,7 @@ class SQLDataFrameWrapper:
 
         overlap = simple_cols & (complex_cols - set(['chunk_id', 'chunking_index']))
         if len(overlap) > 0:
-            logging.getLogger(__name__).warning(f'We have overlap of complex and simple columns: {overlap} removing the overlap from the complex columns')
+            logging.getLogger(__name__).debug(f'We have overlap of complex and simple columns: {overlap} removing the overlap from the complex columns')
             complex_cols = complex_cols - overlap
 
 
@@ -601,7 +610,7 @@ class SQLDataFrameWrapper:
         self._connection = {}
 
         self.thread_executor.shutdown(wait = True)
-        self.thread_executor = ThreadPoolExecutor(4)
+        self.thread_executor = ThreadPoolExecutor(2)
         return state
 
     def update(self, df, swap = False):
@@ -761,7 +770,7 @@ class SQLDataFrameWrapper:
         - df: DataFrame with new data.
         """
         self.thread_executor.shutdown(wait = True)
-        self.thread_executor = ThreadPoolExecutor(8)
+        self.thread_executor = ThreadPoolExecutor(2)
 
         # Ensure chunking_index is present in the DataFrame
         if "chunking_index" not in df.columns:
@@ -833,7 +842,7 @@ class SQLDataFrameWrapper:
         self._cached_chunk_files = None
         self.special_types = state['special_types']
         self._last_modified_time = None
-        self.thread_executor = ThreadPoolExecutor(8)
+        self.thread_executor = ThreadPoolExecutor(2)
         self._chunk_cache = FileCache()
         self.always_commit = state.get('always_commit', False)
         self._loc_indexer = SQLDataFrameWrapper.LocIndexer(self)
@@ -861,13 +870,14 @@ class SQLDataFrameWrapper:
             else:
                 simple_columns_df.to_sql("data", conn, index=True, if_exists="replace")
                 for col in self.simple_columns:
-                    try:
-                        conn.execute(f"CREATE INDEX idx_{col} ON data ({col})")
-                    except sqlite3.OperationalError as exc:
-                        if "already exists" in exc.args[0]:
-                            pass
-                        else:
-                            raise
+                    if len(str(df[col].values[0])) < 15:
+                        try:
+                            conn.execute(f"CREATE INDEX idx_{col} ON data ({col})")
+                        except sqlite3.OperationalError as exc:
+                            if "already exists" in exc.args[0]:
+                                pass
+                            else:
+                                raise
 
         with self.append_lock:
             for chunk_id, chunk in df.groupby(['chunk_id'], group_keys = True, as_index = False):
@@ -887,7 +897,8 @@ class SQLDataFrameWrapper:
                     #if not append:
                     #    raise RuntimeError(f'Trying to append a chunk to an already existing one! {filename}')
 
-                new_chunk.to_pickle(filename)
+                with open(filename, "wb") as f:
+                    dill.dump(new_chunk, f)
 
     @property
     def chunk_files(self):
@@ -1104,7 +1115,7 @@ class SQLDataFrameWrapper:
 
     def _preload_all_chunks(self):
         futures = []
-        with ThreadPoolExecutor(8) as executor:
+        with ThreadPoolExecutor(3) as executor:
             with tqdm.tqdm(total = len(self.chunk_files), desc = 'Submitting prefetching for all files') as pbar:
                 for indx, file_name in self.chunk_files.items():
                     pbar.update(1)
@@ -1176,7 +1187,7 @@ class SQLDataFrameWrapper:
     def commit(self):
         # wait for all the threads to finish
         self.thread_executor.shutdown(wait=True)
-        self.thread_executor = ThreadPoolExecutor(8)
+        self.thread_executor = ThreadPoolExecutor(2)
 
         self._chunk_cache.commit()
 
@@ -1298,7 +1309,7 @@ class SQLDataFrameWrapper:
         else:
             if len(queried_df) > 0:
                 done = 0
-                with ThreadPoolExecutor(4) as executor:
+                with ThreadPoolExecutor(2) as executor:
                     results = [executor.submit(self.fetch_raw_chunk, int(chunk_idx)) for chunk_idx in list(queried_df['chunk_id'].unique())]
                     with tqdm.tqdm(desc = 'fetching full chunks to merge with query', total =  queried_df['chunk_id'].nunique()) as pbar:
                         for future in as_completed(results):
