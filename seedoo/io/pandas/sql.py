@@ -5,6 +5,13 @@ import psutil
 import collections
 import multiprocessing
 import uuid
+is_postgress = True
+
+try:
+    import psycopg2
+except ImportError as exc:
+    is_postgress = False
+    pass
 
 import seedoo.logger_helpers.logger_setup
 import ast
@@ -17,7 +24,6 @@ import pickle
 import numpy as np
 import re
 import inspect
-import dill
 import asyncio
 import threading
 import tqdm
@@ -37,14 +43,12 @@ def set_pragmas_for_conn(conn):
 
     cur = conn.cursor()
     cur.execute("PRAGMA page_size;")
-    page_size = cur.fetchone()[0]
+    page_size = 32768
     desired_cache_size_bytes = 5 * (1024 ** 3)
 
 
-    cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("PRAGMA temp_store = MEMORY;")  # Use memory for temporary tables and indices
     cur.execute("PRAGMA foreign_keys=OFF;")  # Turn off foreign key constraints (if you're sure you don't need them)
-    cur.execute("PRAGMA wal_autocheckpoint=1000000;")  # Increase WAL checkpoint interval
     # Calculate the number of pages required for the desired cache size
     num_pages = desired_cache_size_bytes // page_size
 
@@ -53,6 +57,7 @@ def set_pragmas_for_conn(conn):
 
 
     conn.execute("PRAGMA synchronous=OFF;")
+    cur.execute("PRAGMA journal_mode = MEMORY;")
     mmap_size = desired_cache_size_bytes  # Setting it to the same size as the cache for simplicity
     cur.execute(f"PRAGMA mmap_size={mmap_size};")
     cur.close()
@@ -69,7 +74,7 @@ sqlite3.connect = optimized_sqlite3_connect
 original_to_sql = pd.DataFrame.to_sql
 
 
-def custom_read_sql(sql, con, index_col = None, chunk_size=5000):
+def custom_read_sql(sql, con, index_col = None, chunk_size=150000):
     logger = logging.getLogger(__name__)
     # Create a cursor from the connection
     cur = con.cursor()
@@ -140,46 +145,48 @@ def custom_to_sql(
     """
     Custom to_sql function to improve SQLite writing performance.
     """
+    logger = logging.getLogger(__name__)
 
-    # If 'replace', use original pandas to_sql for the first few rows to set up table schema
-    if if_exists == 'replace':
-        # We do this because for some reason executemany (later in the code) has a bug that when vals is of length 1
-        # it just inserts Null. I have no idea why, but this is a hack to overcome it.
-        if len(df.columns.values) < 2:
-            df['extra_spare_column'] = 'extra'
+    try:
+        # If 'replace', use original pandas to_sql for the first few rows to set up table schema
+        if if_exists == 'replace':
+            # We do this because for some reason executemany (later in the code) has a bug that when vals is of length 1
+            # it just inserts Null. I have no idea why, but this is a hack to overcome it.
+            if len(df.columns.values) < 2:
+                df['extra_spare_column'] = 'extra'
 
-        logger = logging.getLogger(__name__)
-        start = time.time()
-        logger.info('Started insert with to_sql')
+            start = time.time()
+            logger.debug('Started insert with to_sql')
 
-        if "index" in df:
-            del df['index']
+            if "index" in df:
+                del df['index']
 
-        original_to_sql(df.iloc[:1], name, con, if_exists=if_exists, index=False, index_label=index_label,
-                        dtype=dtype)
+            original_to_sql(df.iloc[:1], name, con, if_exists=if_exists, index=False, index_label=index_label,
+                            dtype=dtype)
 
-        con.commit()
-        df = df.iloc[1:]
-        if_exists = 'append'  # Switch to 'append' mode for the remaining rows
-        end = time.time()
-        logger.debug(f'Finished insert with to_sql, it took: {(end - start) * 1000} ms')
+            con.commit()
+            df = df.iloc[1:]
+            if_exists = 'append'  # Switch to 'append' mode for the remaining rows
+            end = time.time()
+            logger.debug(f'Finished insert with to_sql, it took: {(end - start) * 1000} ms')
 
 
-    # Create a connection and cursor
-    if if_exists == 'append':
-        cur = con.cursor()
-        # Calculate chunk size, if not provided
-        chunksize = chunksize or 20000
-        column_names = ", ".join([f'{col}' for col in df.columns])
-        # Prepare the placeholders
-        num_columns = len(df.columns)
-        placeholders = ", ".join(["?"] * num_columns)
-        logger = logging.getLogger(__name__)
-        #cur.execute("BEGIN;")
-        logger.debug(f'Starting inserting for df length {len(df)} and num columns: {len(df.columns.unique())}')
+        # Create a connection and cursor
+        if if_exists == 'append':
+            cur = con.cursor()
+            # Calculate chunk size, if not provided
+            chunksize = chunksize or 150000
+            column_names = ", ".join([f'{col}' for col in df.columns])
+            # Prepare the placeholders
+            num_columns = len(df.columns)
+            placeholders = ", ".join(["?"] * num_columns)
+            logger = logging.getLogger(__name__)
 
-        with tqdm.tqdm(total = len(df), desc = f'SQLLite batch insert for df of length: {len(df)}, chunk_size: {chunksize}') as pbar:
+            logger.debug(f'Starting inserting for df length {len(df)} and num columns: {len(df.columns.unique())}')
+            insert_sql = f"INSERT INTO {name} ({column_names}) VALUES ({placeholders})"
+
             for start in range(0, len(df), chunksize):
+                cur.execute("BEGIN TRANSACTION ;")
                 end = start + chunksize
                 batch = df.iloc[start:end]
                 # Extract column names from the DataFrame
@@ -187,17 +194,17 @@ def custom_to_sql(
 
                 # Execute the in sert with explicit column names
                 s = time.time()
-                cur.executemany(f"INSERT INTO {name} ({column_names}) VALUES ({placeholders})", data)
+                cur.executemany(insert_sql, data)
                 e = time.time()
-                logger.debug(f'Finished inserting: {(e -s) * 1000} ms')
-                pbar.update(len(batch))
-        logger.debug('Committing for batch')
-        #cur.execute("END;")
-        logger.debug('Done committing for batch')
+                logger.info(f'Finished inserting: {(e -s) * 1000} ms')
+                logger.debug('Committing for batch')
+                cur.execute("COMMIT;")
+            logger.debug('Done committing for batch')
 
-        cur.close()
-    con.commit()
-
+            cur.close()
+    except Exception as exc:
+        logger.exception('Error in to_sql')
+        raise
 
 # Monkey patch pandas DataFrame's to_sql with our custom version
 pd.DataFrame.to_sql = custom_to_sql
@@ -296,17 +303,16 @@ class DataFrameGroupByWrapper:
         return pd.concat(results, axis=0)
 
 
-def optimize_sqlite(conn, desired_cache_size_gb=5):
+def optimize_sqlite(conn, desired_cache_size_gb=10):
     # Convert desired cache size from GB to bytes
     desired_cache_size_bytes = desired_cache_size_gb * 1024 ** 3
 
     # Connect to the SQLite database
     cur = conn.cursor()
-    cur.execute(f"PRAGMA page_size={1024 * 1024 * 10};")
+    cur.execute(f"PRAGMA page_size=32768;")
     # Get the page size
 
-    cur.execute("PRAGMA page_size;")
-    page_size = cur.fetchone()[0]
+    page_size = 32768
 
     # Calculate the number of pages required for the desired cache size
     num_pages = desired_cache_size_bytes // page_size
@@ -315,15 +321,15 @@ def optimize_sqlite(conn, desired_cache_size_gb=5):
     cur.execute(f"PRAGMA cache_size={num_pages};")
 
     # Set other performance enhancing pragmas
-    cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("PRAGMA synchronous=OFF;")
+    cur.execute("PRAGMA temp_store = MEMORY;")  # Use memory for temporary tables and indices
+    cur.execute("PRAGMA journal_mode = MEMORY;")
 
     # Set memory-mapped I/O size
     mmap_size = desired_cache_size_bytes  # Setting it to the same size as the cache for simplicity
     cur.execute(f"PRAGMA mmap_size={mmap_size};")
     cur.execute("PRAGMA temp_store = MEMORY;")  # Use memory for temporary tables and indices
     cur.execute("PRAGMA foreign_keys=OFF;")  # Turn off foreign key constraints (if you're sure you don't need them)
-    cur.execute("PRAGMA wal_autocheckpoint=1000000;")  # Increase WAL checkpoint interval
 
     cur.close()
     # Commit changes and close the connection
@@ -399,8 +405,9 @@ class SQLDataFrameWrapper:
                 col_idx = None
                 return self.wrapper._iloc_method(row_idx, col_idx)
 
-    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 100):
-        self.db_name = os.path.join(path, db_name)
+    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 10000):
+        self.db_name = os.path.dirname(path)
+        #os.path.join(path, db_name)
         self.complex_columns = []
         self._chunk_cache = FileCache()
         self.eval_cache = {}
@@ -425,11 +432,23 @@ class SQLDataFrameWrapper:
 
     @property
     def connection(self):
-        thread_id =  threading.get_ident() % 8
+        thread_id =  threading.get_ident()
 
         if thread_id not in self._connection:
-            self._connection[thread_id] = sqlite3.connect(self.db_name, check_same_thread=False)
-            optimize_sqlite(self._connection[thread_id])
+            if is_postgress:
+                conn = self._connection[thread_id] = psycopg2.connect(
+                                                dbname=f'seedoo',
+                                                user='seedoo',
+                                                password='kDASAEspJEdHp7',
+                                                host='localhost'
+                                            )
+            else:
+                conn = sqlite3.connect(self.db_name, check_same_thread=False, isolation_level=None)
+                optimize_sqlite(self._connection[thread_id])
+
+            self._connection[thread_id] = conn
+
+            print(f'Total connections: {len(self._connection)}')
 
         return self._connection[thread_id]
 
@@ -637,7 +656,7 @@ class SQLDataFrameWrapper:
 
         conn = self.connection
         # Step 3: Insert the new DataFrame into a temporary table
-        self.logger.info(f'Inserting df of length {len(df)} into temp table for update')
+        self.logger.debug(f'Inserting df of length {len(df)} into temp table for update')
         temp_table_name = f'temp_new_data_{str(uuid.uuid1()).replace("-", "")}'
         with self.append_lock:
             conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
@@ -866,11 +885,11 @@ class SQLDataFrameWrapper:
             if append:
                 simple_columns = list(set(simple_columns_df.columns.values) & set(self.simple_columns))
                 simple_columns_df = simple_columns_df[simple_columns]
-                simple_columns_df.to_sql("data", conn, index=True, if_exists="append")
+                simple_columns_df.to_sql("data", conn, index=False, if_exists="append")
             else:
-                simple_columns_df.to_sql("data", conn, index=True, if_exists="replace")
+                simple_columns_df.to_sql("data", conn, index=False, if_exists="replace")
                 for col in self.simple_columns:
-                    if len(str(df[col].values[0])) < 15:
+                    if False:
                         try:
                             conn.execute(f"CREATE INDEX idx_{col} ON data ({col})")
                         except sqlite3.OperationalError as exc:
@@ -888,8 +907,7 @@ class SQLDataFrameWrapper:
                     os.makedirs(os.path.dirname(filename))
 
                 if os.path.exists(filename):
-                    with open(filename, "rb") as f:
-                        existing_chunk = dill.load(f)
+                    existing_chunk = pd.read_pickle(filename)
                     if append:
                         new_chunk = pd.concat([existing_chunk, new_chunk])
                         new_chunk = new_chunk.drop_duplicates(subset = ['chunk_id', 'chunking_index'])
@@ -897,8 +915,7 @@ class SQLDataFrameWrapper:
                     #if not append:
                     #    raise RuntimeError(f'Trying to append a chunk to an already existing one! {filename}')
 
-                with open(filename, "wb") as f:
-                    dill.dump(new_chunk, f)
+                new_chunk.to_pickle(filename)
 
     @property
     def chunk_files(self):
@@ -1266,8 +1283,7 @@ class SQLDataFrameWrapper:
                 chunk_file = self.chunk_files[int(chunk_index)]
 
             if chunk_file not in self._chunk_cache:
-                with open(chunk_file, "rb") as f:
-                    cached_chunk = dill.load(f)
+                cached_chunk = pd.read_pickle(chunk_file)
 
                 had_fixes = False
                 for c in cached_chunk.columns.values:
