@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 import pickle
@@ -7,6 +8,7 @@ import dill
 
 class FileCache:
     def __init__(self):
+        self.logger = logging.getLogger(__name__)
         self.cache = {}  # This will hold the data
 
     def __contains__(self, filename):
@@ -25,8 +27,11 @@ class FileCache:
         return self.cache[filename]['data']
 
     def __setitem__(self, filename, value):
-        with open(filename, "wb") as f:
-            dill.dump(value, f)
+        if isinstance(value, pd.DataFrame):
+            value.to_pickle(filename)
+        else:
+            with open(filename, "wb") as f:
+                dill.dump(value, f)
 
         current_time = os.path.getmtime(filename)
 
@@ -61,17 +66,20 @@ class FileCache:
         return self.cache.keys()
 
     def commit(self):
-        with tqdm.tqdm(total = len(self.cache), desc = 'Comitting in memory chunks') as pbar:
+        with tqdm.tqdm(total = len(self.cache), desc = 'Committing in memory chunks') as pbar:
             for filename, data in self.cache.items():
-                # If in-memory modified time is newer than the file's modified time
-                if data['last_modified_time'] > os.path.getmtime(filename):
-                    if isinstance(data, (pd.DataFrame,)):
-                        with open(filename, "wb") as f:
-                            dill.dump(data['data'], f)
-                        data['last_modified_time'] = os.path.getmtime(filename)
-                    else:
-                        with open(filename, 'wb') as file:
-                            dill.dump(data['data'], file)
-                        os.utime(filename, (data['last_access_time'], data['last_modified_time']))
-                pbar.update(1)
+                try:
+                    # If in-memory modified time is newer than the file's modified time
+                    if data['last_modified_time'] > os.path.getmtime(filename):
+                        if isinstance(data, (pd.DataFrame,)):
+                            data.to_pickle(filename)
+                            data['last_modified_time'] = os.path.getmtime(filename)
+                        else:
+                            with open(filename, 'wb') as file:
+                                dill.dump(data['data'], file)
+                            os.utime(filename, (data['last_access_time'], data['last_modified_time']))
+                except Exception as exc:
+                    self.logger.exception('Error in comit')
 
+                finally:
+                    pbar.update(1)

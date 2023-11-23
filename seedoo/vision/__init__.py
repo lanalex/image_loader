@@ -13,9 +13,10 @@ def pandas():
 
         from IPython.display import HTML, display
         columns = self.columns.values.tolist()
-        for c in columns:
-            if isinstance(self[c].values[0], pd.DataFrame):
-                self[c] = self[c].apply(lambda x: x.render(perform_display=False, index = False))
+        if len(self) > 0:
+            for c in columns:
+                if isinstance(self[c].values[0], pd.DataFrame):
+                    self[c] = self[c].apply(lambda x: x.render(perform_display=False, index = False))
 
         html = self.to_html(escape=False, index = index).replace("\n", "")
         css_style = """

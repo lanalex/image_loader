@@ -129,17 +129,19 @@ def initialize_logger():
     # Check if we are in jupyter, if so we don't want to write to stdout
     # Note we catch ONLY the import error, in case there is no ipython or jupyter installed
     # we don't catch a generic error
+    add_stdout = True
     try:
         from IPython import get_ipython
 
         # Determine the correct progress bar to use
-        if get_ipython() is None:
-            # Get root logger
-            stdout_handler = logging.StreamHandler(sys.stdout)
-            stdout_handler.setFormatter(formatter)
-            logger.addHandler(stdout_handler)
+        if get_ipython() is not None:
+            add_stdout = False
     except ImportError:
         pass
+    if add_stdout:
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        stdout_handler.setFormatter(formatter)
+        logger.addHandler(stdout_handler)
 
     syslog_address = '/var/run/syslog' if platform.system() == 'Darwin' else '/dev/log'
     syslog_handler = SysLogHandler(address=syslog_address, facility=SysLogHandler.LOG_LOCAL0)

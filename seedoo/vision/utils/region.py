@@ -574,7 +574,7 @@ class Region:
     @staticmethod
     def group_regions_df(df: pd.DataFrame, coordinate_columns=['xmin', 'ymin', 'xmax', 'ymax'],
                          cluster_column_name: str = 'cluster_id',
-                         max_relative_distance: float = 0.1, score_column_name = None, score_tolerance = 0.75) -> pd.DataFrame:
+                         max_relative_distance: float = 0.1, score_column_name = None, score_tolerance = 0.65) -> pd.DataFrame:
 
         if len(df) == 0:
             return df
@@ -725,8 +725,8 @@ class Region:
             for k,v in label.items():
                 if v:
                     final_label = f"{v}"
-                    label_width, label_height = cv2.getTextSize(final_label, font, 0.8, thickness)[0]
-                    image = cv2.putText(image, final_label, (current_region.column + current_region.width // 2 - label_width, current_region.row - 10 + offset + label_height), font, 0.3, color, thickness)
+                    label_width, label_height = cv2.getTextSize(final_label, font, 1.0, thickness)[0]
+                    image = cv2.putText(image, final_label, (current_region.column + current_region.width // 2 - label_width, current_region.row - 10 + offset + label_height), font, 0.75, color, thickness)
                     offset += label_height + 20
 
 

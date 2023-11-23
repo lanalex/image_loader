@@ -6,7 +6,7 @@ import collections
 import multiprocessing
 import uuid
 is_postgress = True
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 try:
     import psycopg2
     from psycopg2 import sql
@@ -35,6 +35,8 @@ from seedoo.io.pandas.utils import FileCache
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 pd.options.mode.chained_assignment = None
+
+NUM_THREADS = 8
 
 # Store a reference to the original `sqlite3.connect`.
 #_original_sqlite3_connect = sqlite3.connect
@@ -396,7 +398,7 @@ class SQLDataFrameWrapper:
                 col_idx = None
                 return self.wrapper._iloc_method(row_idx, col_idx)
 
-    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 250):
+    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 1000):
         self.db_name = os.path.dirname(path)
         self.table_name = os.path.basename(self.db_name)
         #os.path.join(path, db_name)
@@ -410,7 +412,7 @@ class SQLDataFrameWrapper:
         self._iloc_indexer = SQLDataFrameWrapper.IlocIndexer(self)
         self.append_lock = threading.Lock()
         self._loc_indexer = SQLDataFrameWrapper.LocIndexer(self)
-        self.thread_executor = ThreadPoolExecutor(2)  # Initializes a thread pool executor
+        self.thread_executor = ThreadPoolExecutor(NUM_THREADS)  # Initializes a thread pool executor
         self.special_types = {}
         self.logger = logging.getLogger(__name__)
         self._connection = {}
@@ -623,7 +625,7 @@ class SQLDataFrameWrapper:
         self._connection = {}
 
         self.thread_executor.shutdown(wait = True)
-        self.thread_executor = ThreadPoolExecutor(2)
+        self.thread_executor = ThreadPoolExecutor(NUM_THREADS)
         return state
 
     def update(self, df, swap = False):
@@ -702,7 +704,7 @@ class SQLDataFrameWrapper:
             # Step 4: Join the temp table with the main data table
             cursor.execute(f"""
                 CREATE TABLE temp_combined_{self.table_name} AS
-                SELECT a.chunking_index as chunking_index, a.chunk_id as chunk_id, {coalesce_expressions} {columns_to_use} {insert_cols}
+                SELECT a.chunking_index as chunking_index, a.chunk_id as chunk_id {extra} {coalesce_expressions} {columns_to_use} {insert_cols}
                 FROM {self.table_name} AS a
                 LEFT JOIN {temp_table_name} AS b
                 ON a.chunking_index = b.chunking_index
@@ -722,7 +724,7 @@ class SQLDataFrameWrapper:
 
         if remaining_complex_columns:
             self.logger.info('Handling complex columns')
-            df = df.drop_duplicates(subset = ['chunking_index', 'chunk_id'])
+            df = df.drop_duplicates(subset = ['chunking_index'])
             self.update_chunked_dataframes(df[provided_complex_cols])
 
 
@@ -795,7 +797,7 @@ class SQLDataFrameWrapper:
         - df: DataFrame with new data.
         """
         self.thread_executor.shutdown(wait = True)
-        self.thread_executor = ThreadPoolExecutor(2)
+        self.thread_executor = ThreadPoolExecutor(NUM_THREADS)
 
         # Ensure chunking_index is present in the DataFrame
         if "chunking_index" not in df.columns:
@@ -869,7 +871,7 @@ class SQLDataFrameWrapper:
         self._cached_chunk_files = None
         self.special_types = state['special_types']
         self._last_modified_time = None
-        self.thread_executor = ThreadPoolExecutor(2)
+        self.thread_executor = ThreadPoolExecutor(NUM_THREADS)
         self._chunk_cache = FileCache()
         self.always_commit = state.get('always_commit', False)
         self._loc_indexer = SQLDataFrameWrapper.LocIndexer(self)
@@ -877,6 +879,7 @@ class SQLDataFrameWrapper:
         self.append_lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
         self.chunk_size = state['chunk_size']
+        self._simple_columns = None
         self.eval_cache = {}
 
         self._iloc_indexer = SQLDataFrameWrapper.IlocIndexer(self)
@@ -893,10 +896,14 @@ class SQLDataFrameWrapper:
             conn = self.connection
             if append:
                 simple_columns = list(set(simple_columns_df.columns.values) & set(self.simple_columns))
+                if 'chunk_id' not in simple_columns:
+                    simple_columns.append('chunk_id')
+
                 simple_columns_df = simple_columns_df[simple_columns]
-                simple_columns_df.to_sql(f"{self.table_name}", conn, index=False, if_exists="append")
+                simple_columns_df.to_sql(f"{self.table_name}", conn, index=False, if_exists="append", method='multi', chunksize = 100_000)
             else:
                 simple_columns_df.to_sql(f"{self.table_name}", conn, index=False, if_exists="replace")
+                #self.setup_partitioning()
 
         with self.append_lock:
             for chunk_id, chunk in df.groupby(['chunk_id'], group_keys = True, as_index = False):
@@ -1137,8 +1144,9 @@ class SQLDataFrameWrapper:
             required_rows.append(cached_chunk)
 
         if len(required_rows) > 0:
+            matching_cols = list(set(self.simple_columns) & set(simple_df.columns.values))
             result_df = pd.concat(required_rows).drop_duplicates(subset=['chunking_index'])
-            result_df = result_df.merge(simple_df[self.simple_columns], on = ['chunking_index', 'chunk_id'])
+            result_df = result_df.merge(simple_df[matching_cols], on = ['chunking_index', 'chunk_id'])
         else:
             result_df = simple_df[self.simple_columns]
 
@@ -1146,7 +1154,7 @@ class SQLDataFrameWrapper:
 
     def _preload_all_chunks(self):
         futures = []
-        with ThreadPoolExecutor(3) as executor:
+        with ThreadPoolExecutor(NUM_THREADS) as executor:
             with tqdm.tqdm(total = len(self.chunk_files), desc = 'Submitting prefetching for all files') as pbar:
                 for indx, file_name in self.chunk_files.items():
                     pbar.update(1)
@@ -1170,6 +1178,32 @@ class SQLDataFrameWrapper:
             result = [i[0] for i in result]
             return pd.Series(list(result))
 
+
+
+    def setup_partitioning(self):
+        try:
+            self.logger.info("Setting up partitioning")
+            table_name = self.table_name
+            chunk_size = self.chunk_size
+            engine = self.connection
+            # Generate the queries to create the partitions
+            queries = [
+                f"""
+                CREATE TABLE {table_name}_chunk{i} PARTITION OF {table_name}
+                FOR VALUES FROM ({i}) TO ({i + 1});
+                """
+                for i in range(0, 5000 + 1)
+            ]
+            # Execute the queries
+            with engine.connect() as connection:
+                for query in queries:
+                    connection.execute(text(query))
+            self.logger.info("Finished Setting up partitioning")
+        except Exception as exc:
+            self.logger.exception('Error in create partitions')
+
+
+
     @classmethod
     def _partition_and_index_table(cls, table_name, conn, simple_columns):
         # First, alter the table to declare it as partitioned
@@ -1184,12 +1218,12 @@ class SQLDataFrameWrapper:
 
     def commit(self):
         # wait for all the threads to finish
-        self.thread_executor.shutdown(wait=True)
-        self.thread_executor = ThreadPoolExecutor(2)
+        self._chunk_cache.commit()
+        self.thread_executor.shutdown(wait=False)
+        self.thread_executor = ThreadPoolExecutor(NUM_THREADS)
         conn = self.connection.raw_connection()
         SQLDataFrameWrapper._partition_and_index_table(self.table_name, conn, self.simple_columns)
 
-        self._chunk_cache.commit()
     def __setitem__(self, key, value):
 
         indexes = self.index.values
@@ -1223,6 +1257,11 @@ class SQLDataFrameWrapper:
 
             # Exclude 'chunking_index' and 'index'
             simple_columns = [col for col in existing_column_names if col not in ['index']]
+            if 'chunk_id' not in simple_columns:
+                simple_columns.append('chunk_id')
+
+            if 'chunking_index' not in simple_columns:
+                simple_columns.append('chunking_index')
 
             self._simple_columns = simple_columns
 
@@ -1284,7 +1323,7 @@ class SQLDataFrameWrapper:
                 self._chunk_cache[chunk_file] = clean
 
             return self._chunk_cache[chunk_file]
-        except EOFError as exc:
+        except (EOFError, pickle.UnpicklingError):
             self.logger.error(f"BAD CHUNK FILE DETECTED , chunked index: {chunk_index}")
             return None
 
