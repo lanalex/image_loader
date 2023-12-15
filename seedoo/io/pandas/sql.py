@@ -7,6 +7,8 @@ import multiprocessing
 import uuid
 is_postgress = True
 from sqlalchemy import create_engine, text
+from sqlalchemy.pool import QueuePool
+
 try:
     import psycopg2
     from psycopg2 import sql
@@ -36,7 +38,7 @@ from seedoo.io.pandas.utils import FileCache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 pd.options.mode.chained_assignment = None
 
-NUM_THREADS = 8
+NUM_THREADS = 4
 
 # Store a reference to the original `sqlite3.connect`.
 #_original_sqlite3_connect = sqlite3.connect
@@ -229,6 +231,7 @@ def pandas_query_to_sqlite(query_str):
             value = f'"{value}"' if isinstance(value, str) else str(value)
             query_str = query_str.replace(match, value)
 
+    query_str = re.sub(r'([a-zA-Z_]+[A-Z_]*[a-zA-Z_]*)\s*(=|>|<|LIKE|IN)', r'"\1" \2', query_str)
     return query_str
 
 class SQLDataFrameAttrWrapper:
@@ -886,43 +889,48 @@ class SQLDataFrameWrapper:
         self._update_complex_columns()
 
     def _store_data(self, df, append=False):
-        df['chunk_id'] = df['chunking_index'].apply(lambda x: int(np.floor(x / self.chunk_size)))
-        _simple_columns, complex_columns, special_types = SQLDataFrameWrapper.identify_column_types(df)
-        self.special_types.update(special_types)
-        simple_columns_df = df[_simple_columns]
+        try:
+            df['chunk_id'] = df['chunking_index'].apply(lambda x: int(np.floor(x / self.chunk_size)))
+            _simple_columns, complex_columns, special_types = SQLDataFrameWrapper.identify_column_types(df)
+            self.special_types.update(special_types)
+            simple_columns_df = df[_simple_columns]
 
-        with self.append_lock:
-            # Save simple columns to SQLite
-            conn = self.connection
-            if append:
-                simple_columns = list(set(simple_columns_df.columns.values) & set(self.simple_columns))
-                if 'chunk_id' not in simple_columns:
-                    simple_columns.append('chunk_id')
+            with self.append_lock:
+                # Save simple columns to SQLite
+                conn = self.connection
+                if append:
+                    simple_columns = list(set(simple_columns_df.columns.values) & set(self.simple_columns))
+                    if 'chunk_id' not in simple_columns:
+                        simple_columns.append('chunk_id')
 
-                simple_columns_df = simple_columns_df[simple_columns]
-                simple_columns_df.to_sql(f"{self.table_name}", conn, index=False, if_exists="append", method='multi', chunksize = 100_000)
-            else:
-                simple_columns_df.to_sql(f"{self.table_name}", conn, index=False, if_exists="replace")
-                #self.setup_partitioning()
+                    simple_columns_df = simple_columns_df[simple_columns]
+                    simple_columns_df.to_sql(f"{self.table_name}", conn, index=False, if_exists="append", method='multi', chunksize = 1_000_000)
+                else:
+                    simple_columns_df.to_sql(f"{self.table_name}", conn, index=False, if_exists="replace")
+                    #self.setup_partitioning()
 
-        with self.append_lock:
-            for chunk_id, chunk in df.groupby(['chunk_id'], group_keys = True, as_index = False):
-                chunk_id = chunk_id[0]
-                filename = f"{os.path.join(self.path, 'chunks')}/chunk_{chunk_id}.pkl"
-                new_chunk = chunk[complex_columns]
-                if not os.path.exists(os.path.dirname(filename)):
-                    os.makedirs(os.path.dirname(filename))
+            with self.append_lock:
+                for chunk_id, chunk in df.groupby(['chunk_id'], group_keys = True, as_index = False):
+                    chunk_id = chunk_id[0]
+                    filename = f"{os.path.join(self.path, 'chunks')}/chunk_{chunk_id}.pkl"
+                    new_chunk = chunk[complex_columns]
+                    if not os.path.exists(os.path.dirname(filename)):
+                        os.makedirs(os.path.dirname(filename))
 
-                if os.path.exists(filename):
-                    existing_chunk = pd.read_pickle(filename)
-                    if append:
-                        new_chunk = pd.concat([existing_chunk, new_chunk])
-                        new_chunk = new_chunk.drop_duplicates(subset = ['chunk_id', 'chunking_index'])
+                    if os.path.exists(filename):
+                        existing_chunk = pd.read_pickle(filename)
+                        if append:
+                            new_chunk = pd.concat([existing_chunk, new_chunk])
+                            new_chunk = new_chunk.drop_duplicates(subset = ['chunk_id', 'chunking_index'])
 
-                    #if not append:
-                    #    raise RuntimeError(f'Trying to append a chunk to an already existing one! {filename}')
+                        #if not append:
+                        #    raise RuntimeError(f'Trying to append a chunk to an already existing one! {filename}')
 
-                new_chunk.to_pickle(filename)
+                    new_chunk.to_pickle(filename)
+
+        except Exception as exc:
+            self.logger.exception("error in store data")
+
 
     @property
     def chunk_files(self):
@@ -1219,7 +1227,9 @@ class SQLDataFrameWrapper:
     def commit(self):
         # wait for all the threads to finish
         self._chunk_cache.commit()
-        self.thread_executor.shutdown(wait=False)
+        self.logger.info('Comitting and closing thread pool , but first waiting for it to finish')
+        self.thread_executor.shutdown(wait=True)
+        self.logger.info('Commited thread pool, it finished')
         self.thread_executor = ThreadPoolExecutor(NUM_THREADS)
         conn = self.connection.raw_connection()
         SQLDataFrameWrapper._partition_and_index_table(self.table_name, conn, self.simple_columns)
