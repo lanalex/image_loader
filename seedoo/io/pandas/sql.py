@@ -6,7 +6,7 @@ import collections
 import multiprocessing
 import uuid
 is_postgress = True
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, MetaData, Table
 from sqlalchemy.pool import QueuePool
 
 try:
@@ -38,10 +38,55 @@ from seedoo.io.pandas.utils import FileCache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 pd.options.mode.chained_assignment = None
 
-NUM_THREADS = 4
+NUM_THREADS = 8
+
 
 # Store a reference to the original `sqlite3.connect`.
 #_original_sqlite3_connect = sqlite3.connect
+from io import StringIO
+import csv
+from seedoo.io.pandas.parallel_to_csv import to_csv_parallel
+def psql_insert_copy(table_name, conn, keys, data_iter):
+    # Create a MetaData instance
+    metadata = MetaData()
+
+    # Reflect the table from the database
+    table = Table(table_name, metadata, autoload_with=conn)
+
+    # gets a DBAPI connection that can provide a cursor
+    dbapi_conn = conn.raw_connection()
+
+    logger = logging.getLogger(__name__)
+    with dbapi_conn.cursor() as cur:
+
+        s = time.time()
+        if isinstance(data_iter, pd.DataFrame):
+            s_buf = to_csv_parallel(data_iter)
+            #data_iter.to_csv(s_buf, index=False, header=False, sep=',', quoting=csv.QUOTE_MINIMAL)
+        else:
+            s_buf = StringIO()
+            writer = csv.writer(s_buf)
+            writer.writerows(data_iter)
+
+        e = time.time()
+        logger.info(f'CSV writer took: {(e-s) * 1000} ms')
+
+        s_buf.seek(0)
+
+        columns = ', '.join('"{}"'.format(k) for k in keys)
+        if table.schema:
+            table_name = '{}.{}'.format(table.schema, table.name)
+        else:
+            table_name = table.name
+
+        sql = 'COPY {} ({}) FROM STDIN WITH CSV'.format(
+                              table_name, columns)
+
+
+        s = time.time()
+        cur.copy_expert(sql=sql, file=s_buf)
+        e = time.time()
+        logger.info(f'cursor copy_expert took took: {(e-s) * 1000} ms')
 
 def set_pragmas_for_conn(conn):
     """Set optimized pragmas for a sqlite3 connection."""
@@ -401,7 +446,7 @@ class SQLDataFrameWrapper:
                 col_idx = None
                 return self.wrapper._iloc_method(row_idx, col_idx)
 
-    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 1000):
+    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 10000):
         self.db_name = os.path.dirname(path)
         self.table_name = os.path.basename(self.db_name)
         #os.path.join(path, db_name)
@@ -440,7 +485,12 @@ class SQLDataFrameWrapper:
             #                            )
 
             connection_string = f'postgresql+psycopg2://seedoo:kDASAEspJEdHp7@localhost/seedoo'
-            conn = create_engine(connection_string, isolation_level="AUTOCOMMIT")
+            conn = create_engine(connection_string, isolation_level="AUTOCOMMIT",
+            pool_size=5,  # Maximum number of permanent connections to keep
+            max_overflow=10,  # Maximum number of overflow connections
+            pool_timeout=30,  # Timeout for acquiring a connection from the pool
+            pool_recycle=1800  # Time in seconds a connection can be reused
+            )
             self._connection[thread_id] = conn
 
             print(f'Total connections: {len(self._connection)}')
@@ -492,7 +542,7 @@ class SQLDataFrameWrapper:
         temp_table_name = temp_table_name.replace("_", "")[0:60]
         with self.append_lock:
 
-            temp_df.to_sql(f"{temp_table_name}", self.connection, if_exists="replace", index=False, method='multi')
+            temp_df.to_sql(f"{temp_table_name}", self.connection, if_exists="replace", index=False, method='multi', chunksize=1000)
             cursor.execute(f"CREATE INDEX IF NOT EXISTS chunking_index_idx_temp_table ON {temp_table_name} (chunking_index)")
 
             # Join the temp table with the main data table on chunking_index
@@ -690,7 +740,7 @@ class SQLDataFrameWrapper:
 
             cursor.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
 
-            df[provided_simple_cols].to_sql(temp_table_name, conn, if_exists='replace', index=False, method='multi', chunksize = 100_000)
+            df[provided_simple_cols].to_sql(temp_table_name, conn, if_exists='replace', index=False, method='multi', chunksize = 1000)
 
             self.logger.info(f'Creating index for temp table on bulk insert')
             # Step 6: Re-add indices to the new data table
@@ -889,6 +939,7 @@ class SQLDataFrameWrapper:
         self._update_complex_columns()
 
     def _store_data(self, df, append=False):
+        logger = logging.getLogger(__name__)
         try:
             df['chunk_id'] = df['chunking_index'].apply(lambda x: int(np.floor(x / self.chunk_size)))
             _simple_columns, complex_columns, special_types = SQLDataFrameWrapper.identify_column_types(df)
@@ -898,16 +949,23 @@ class SQLDataFrameWrapper:
             with self.append_lock:
                 # Save simple columns to SQLite
                 conn = self.connection
+                if not append:
+                    simple_columns_df.head(1).to_sql(f"{self.table_name}", conn, index=False, if_exists="replace")
+                    append = True
+                    simple_columns_df = simple_columns_df.iloc[1:]
+
                 if append:
                     simple_columns = list(set(simple_columns_df.columns.values) & set(self.simple_columns))
                     if 'chunk_id' not in simple_columns:
                         simple_columns.append('chunk_id')
 
                     simple_columns_df = simple_columns_df[simple_columns]
-                    simple_columns_df.to_sql(f"{self.table_name}", conn, index=False, if_exists="append", method='multi', chunksize = 1_000_000)
-                else:
-                    simple_columns_df.to_sql(f"{self.table_name}", conn, index=False, if_exists="replace")
-                    #self.setup_partitioning()
+                    start = time.time()
+                    psql_insert_copy(f"{self.table_name}", conn, simple_columns, simple_columns_df)
+                    #simple_columns_df.to_sql(f"{self.table_name}", conn,  index=False, if_exists='append', method=psql_insert_copy)
+                    end = time.time()
+                    logger.info(f'Inserted {len(simple_columns_df)} rows into db, it took {(end - start) * 1000} ms')
+
 
             with self.append_lock:
                 for chunk_id, chunk in df.groupby(['chunk_id'], group_keys = True, as_index = False):
@@ -929,7 +987,7 @@ class SQLDataFrameWrapper:
                     new_chunk.to_pickle(filename)
 
         except Exception as exc:
-            self.logger.exception("error in store data")
+            logger.exception("error in store data")
 
 
     @property
@@ -1006,7 +1064,12 @@ class SQLDataFrameWrapper:
 
     def _sync_append(self, df):
         try:
+            logger = logging.getLogger(__name__)
+            s = time.time()
             df['chunking_index'] = df.core_index.values.astype(np.int32)
+            e = time.time()
+            logger.info(f'Adding chunking index took: {(e - s) * 1000} ms')
+
             self._store_data(df, append=True)
         except Exception as exc:
             self.logger.exception('Error in write append')
@@ -1397,9 +1460,9 @@ class SQLDataFrameWrapper:
     def query(self, query_str, start = None, stop = None, from_clause = "*", extra = "", with_complex = True):
         query_str = pandas_query_to_sqlite(query_str)
         if start is not None and stop is not None:
-            return self._inner_query(f"SELECT {from_clause} FROM {self.table_name} WHERE {query_str}  {extra} LIMIT {stop} OFFSET {start}", with_complex)
+            return self._inner_query(f"SELECT {from_clause} FROM {self.table_name} WHERE {query_str}  {extra} ORDER BY chunking_index asc LIMIT {stop} OFFSET {start}", with_complex)
         else:
-            return self._inner_query(f"SELECT {from_clause} FROM {self.table_name} WHERE {query_str} {extra}", with_complex)
+            return self._inner_query(f"SELECT {from_clause} FROM {self.table_name} WHERE {query_str} {extra} ORDER BY chunking_index asc", with_complex)
 
     @property
     def iloc(self):
