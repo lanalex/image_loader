@@ -38,7 +38,7 @@ from seedoo.io.pandas.utils import FileCache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 pd.options.mode.chained_assignment = None
 
-NUM_THREADS = 8
+NUM_THREADS = 4
 
 
 # Store a reference to the original `sqlite3.connect`.
@@ -51,18 +51,24 @@ def psql_insert_copy(table_name, conn, keys, data_iter):
     metadata = MetaData()
 
     # Reflect the table from the database
-    table = Table(table_name, metadata, autoload_with=conn)
+    if isinstance(table_name, (str,)):
+        table = Table(table_name, metadata, autoload_with=conn)
+        dbapi_conn = conn.raw_connection()
+
+    else:
+        table = table_name
+        dbapi_conn = conn.connection
 
     # gets a DBAPI connection that can provide a cursor
-    dbapi_conn = conn.raw_connection()
 
     logger = logging.getLogger(__name__)
     with dbapi_conn.cursor() as cur:
 
         s = time.time()
         if isinstance(data_iter, pd.DataFrame):
-            s_buf = to_csv_parallel(data_iter)
-            #data_iter.to_csv(s_buf, index=False, header=False, sep=',', quoting=csv.QUOTE_MINIMAL)
+            #s_buf = to_csv_parallel(data_iter)
+            s_buf = StringIO()
+            data_iter.to_csv(s_buf, index=False, header=False, sep=',', quoting=csv.QUOTE_MINIMAL)
         else:
             s_buf = StringIO()
             writer = csv.writer(s_buf)
@@ -446,7 +452,7 @@ class SQLDataFrameWrapper:
                 col_idx = None
                 return self.wrapper._iloc_method(row_idx, col_idx)
 
-    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 10000):
+    def __init__(self, df=None, db_name="database.db", path = os.getcwd(), chunk_size = 100_000):
         self.db_name = os.path.dirname(path)
         self.table_name = os.path.basename(self.db_name)
         #os.path.join(path, db_name)
@@ -542,7 +548,7 @@ class SQLDataFrameWrapper:
         temp_table_name = temp_table_name.replace("_", "")[0:60]
         with self.append_lock:
 
-            temp_df.to_sql(f"{temp_table_name}", self.connection, if_exists="replace", index=False, method='multi', chunksize=1000)
+            temp_df.to_sql(f"{temp_table_name}", self.connection, if_exists="replace", index=False, method=psql_insert_copy, chunksize=1_000_000)
             cursor.execute(f"CREATE INDEX IF NOT EXISTS chunking_index_idx_temp_table ON {temp_table_name} (chunking_index)")
 
             # Join the temp table with the main data table on chunking_index
@@ -740,7 +746,7 @@ class SQLDataFrameWrapper:
 
             cursor.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
 
-            df[provided_simple_cols].to_sql(temp_table_name, conn, if_exists='replace', index=False, method='multi', chunksize = 1000)
+            df[provided_simple_cols].to_sql(temp_table_name, conn, if_exists='replace', index=False, method=psql_insert_copy, chunksize = 1_000_000)
 
             self.logger.info(f'Creating index for temp table on bulk insert')
             # Step 6: Re-add indices to the new data table
@@ -1289,9 +1295,10 @@ class SQLDataFrameWrapper:
 
     def commit(self):
         # wait for all the threads to finish
+        self.logger.info('Starting chunk_cache commit')
         self._chunk_cache.commit()
         self.logger.info('Comitting and closing thread pool , but first waiting for it to finish')
-        self.thread_executor.shutdown(wait=True)
+        self.thread_executor.shutdown(wait=False)
         self.logger.info('Commited thread pool, it finished')
         self.thread_executor = ThreadPoolExecutor(NUM_THREADS)
         conn = self.connection.raw_connection()
