@@ -39,7 +39,7 @@ from seedoo.io.pandas.utils import FileCache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 pd.options.mode.chained_assignment = None
 
-NUM_THREADS = 4
+NUM_THREADS = 32
 
 
 # Store a reference to the original `sqlite3.connect`.
@@ -481,7 +481,7 @@ class SQLDataFrameWrapper:
                 col_idx = None
                 return self.wrapper._iloc_method(row_idx, col_idx)
 
-    def __init__(self, df=None, db_name="database.db", table_name = None, path = os.getcwd(), chunk_size = 1000):
+    def __init__(self, df=None, db_name="database.db", table_name = None, path = os.getcwd(), chunk_size = 100):
         self.db_name = os.path.dirname(path)
         if table_name is not None:
             self.table_name = table_name
@@ -573,35 +573,44 @@ class SQLDataFrameWrapper:
             conn = self.connection
             subset_df = pd.read_sql(query, conn)
 
-
-        temp_df = pd.DataFrame({'chunking_index': row_labels})
-
-        # Insert row_labels into a temp table
-        conn = self.connection.raw_connection()
-        cursor = conn.cursor()
-        temp_table_name = f"temp_table_{self.table_name}_{str(uuid.uuid1()).replace('-', '')}"
-        temp_table_name = temp_table_name.replace("_", "")[0:60]
-        with self.append_lock:
-
-            temp_df.to_sql(f"{temp_table_name}", self.connection, if_exists="replace", index=False, method=psql_insert_copy, chunksize=1_000_000)
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS chunking_index_idx_temp_table ON {temp_table_name} (chunking_index)")
-
-            # Join the temp table with the main data table on chunking_index
+        if row_labels is not None and len(row_labels) < 1000:
+            row_labels_str = ",".join([str(i) for i in row_labels])
             query = f"""
                 SELECT {columns_query}
-                FROM {self.table_name}
-                JOIN {temp_table_name} ON {self.table_name}.chunking_index = {temp_table_name}.chunking_index
+                FROM {self.table_name} where chunking_index in ({row_labels_str})
             """
             subset_df = pd.read_sql(query, self.connection)
+        else:
+            temp_df = pd.DataFrame({'chunking_index': row_labels})
 
-            #cursor.execute(f"DROP TABLE {temp_table_name}")
-            cursor.close()
-            conn.commit()
+            # Insert row_labels into a temp table
+            conn = self.connection.raw_connection()
+            cursor = conn.cursor()
+            temp_table_name = f"temp_table_{self.table_name}_{str(uuid.uuid1()).replace('-', '')}"
+            temp_table_name = temp_table_name.replace("_", "")[0:60]
+            with self.append_lock:
+
+                temp_df.to_sql(f"{temp_table_name}", self.connection, if_exists="replace", index=False, method=psql_insert_copy, chunksize=1_000_000)
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS chunking_index_idx_temp_table ON {temp_table_name} (chunking_index)")
+
+                # Join the temp table with the main data table on chunking_index
+                query = f"""
+                    SELECT {columns_query}
+                    FROM {self.table_name}
+                    JOIN {temp_table_name} ON {self.table_name}.chunking_index = {temp_table_name}.chunking_index
+                """
+                subset_df = pd.read_sql(query, self.connection)
+
+                cursor.execute(f"DROP TABLE {temp_table_name}")
+                cursor.close()
+                conn.commit()
 
         subset_df = self._restore_types(subset_df)
         self.logger.info(f"Duration of sql fetch in loc method was: {(time.time() - time_start) * 1000} ms for query: {query}")
         if col_labels is None or set(col_labels) & (set(self.complex_columns) - set(['chunking_index', 'chunk_id'])):
             subset_df = self.fetch_all_for_df(subset_df)
+        self.logger.info(f"Duration of FULL  fetch  (with complex) in loc method was: {(time.time() - time_start) * 1000} ms")
+
         return subset_df
 
     @property
@@ -1393,31 +1402,40 @@ class SQLDataFrameWrapper:
         cached_chunk_idx = -1  # Initialize with a non-existent chunk index
         cached_chunk = None  # To store the currently loaded chunk
 
+
+        s = time.time()
+        futures = []
         for chunk_id in sorted_simple_df.chunk_id.unique():
-            # If current row's chunk isn't cached, load and update cache
-            cached_chunk = self.fetch_raw_chunk(chunk_id)
+            future = self.thread_executor.submit(self.fetch_raw_chunk, chunk_id)
+            futures.append(future)
 
-            if cached_chunk is None:
-                continue
+        with tqdm.tqdm(total = len(futures), desc='Fetching complex columns') as pbar:
+            for future in as_completed(futures):
+                # If current row's chunk isn't cached, load and update cache
+                cached_chunk = future.result()
 
-            # Use cached_chunk to extract the necessary rows
-            existing_complex_columns = set(cached_chunk.columns.values)
-            missing = set(self.complex_columns) - existing_complex_columns
-            if len(missing) > 0:
-                self.logger.warning(f'Cached chunk {self.chunk_files[chunk_id]} has missing columns: {list(missing)}')
-                for m in missing:
-                    cached_chunk[m] = ''
+                if cached_chunk is None:
+                    continue
 
-            cached_chunk = cached_chunk[self.complex_columns]
-            required_rows.append(cached_chunk)
+                # Use cached_chunk to extract the necessary rows
+                existing_complex_columns = set(cached_chunk.columns.values)
+                missing = set(self.complex_columns) - existing_complex_columns
+                if len(missing) > 0:
+                    self.logger.warning(f'Cached chunk {self.chunk_files[chunk_id]} has missing columns: {list(missing)}')
+                    for m in missing:
+                        cached_chunk[m] = ''
 
+                cached_chunk = cached_chunk[self.complex_columns]
+                required_rows.append(cached_chunk)
+                pbar.update(1)
+        self.logger.info(f'Chunk pkl fetch duration: {(time.time() - s) * 1000} ms')
         if len(required_rows) > 0:
             matching_cols = list(set(self.simple_columns) & set(simple_df.columns.values))
             result_df = pd.concat(required_rows).drop_duplicates(subset=['chunking_index'])
             result_df = result_df.merge(simple_df[matching_cols], on = ['chunking_index', 'chunk_id'])
         else:
             result_df = simple_df[self.simple_columns]
-
+        self.logger.info(f'Chunk pkl fetch duration after merge: {(time.time() - s) * 1000} ms')
         return result_df
 
     def _preload_all_chunks(self):
