@@ -481,7 +481,7 @@ class SQLDataFrameWrapper:
                 col_idx = None
                 return self.wrapper._iloc_method(row_idx, col_idx)
 
-    def __init__(self, df=None, db_name="database.db", table_name = None, path = os.getcwd(), chunk_size = 100):
+    def __init__(self, df=None, db_name="database.db", table_name = None, path = os.getcwd(), chunk_size = 1000):
         self.db_name = os.path.dirname(path)
         if table_name is not None:
             self.table_name = table_name
@@ -490,6 +490,7 @@ class SQLDataFrameWrapper:
 
         #os.path.join(path, db_name)
         self.complex_columns = []
+        self.partitions = set([])
         self._chunk_cache = FileCache()
         self.eval_cache = {}
         self.path = path
@@ -507,7 +508,7 @@ class SQLDataFrameWrapper:
 
         if df is not None:
             # If append mode, fetch the max chunking_index from the DB and adjust the new df's chunking_index accordingly
-            df['chunking_index'] = df.core_index.values.astype(np.int32)
+            df['chunking_index'] = df.core_index.values.astype(np.int64)
 
             self._simple_columns, self.complex_columns, special_types = SQLDataFrameWrapper.identify_column_types(df)
             self.special_types.update(special_types)
@@ -606,10 +607,10 @@ class SQLDataFrameWrapper:
                 conn.commit()
 
         subset_df = self._restore_types(subset_df)
-        self.logger.info(f"Duration of sql fetch in loc method was: {(time.time() - time_start) * 1000} ms for query: {query}")
+        self.logger.debug(f"Duration of sql fetch in loc method was: {(time.time() - time_start) * 1000} ms for query: {query}")
         if col_labels is None or set(col_labels) & (set(self.complex_columns) - set(['chunking_index', 'chunk_id'])):
             subset_df = self.fetch_all_for_df(subset_df)
-        self.logger.info(f"Duration of FULL  fetch  (with complex) in loc method was: {(time.time() - time_start) * 1000} ms")
+        self.logger.debug(f"Duration of FULL  fetch  (with complex) in loc method was: {(time.time() - time_start) * 1000} ms")
 
         return subset_df
 
@@ -725,7 +726,8 @@ class SQLDataFrameWrapper:
             '_chunk_cache' : {},
             'special_types' : self.special_types,
             'chunk_size' : self.chunk_size,
-            'db_name': self.db_name
+            'db_name': self.db_name,
+            'partitions' : self.partitions
         }
 
         for key, connection in self._connection.items():
@@ -836,7 +838,8 @@ class SQLDataFrameWrapper:
             p.dropna(inplace = True)
 
             if len(p) > 0:
-                self._partition_add(p.min1.values[0],p.max1.values[0] + 1)
+                p = pd.DataFrame({'chunking_index' : np.arange(p.min1.values[0], p.max1.values[0] + 1, 1)})
+                self.partitions_prepare(p)
 
             update_columns = ', '.join([f'{col}=target_table.{col}' for col in df.columns if col != unique_constraint]);
             update_sql = f"""UPDATE {self.table_name} SET {update_columns}  FROM {temp_table_name} as target_table where {self.table_name}.{unique_constraint} = target_table.{unique_constraint}"""
@@ -1091,11 +1094,15 @@ class SQLDataFrameWrapper:
     def __setstate__(self, state):
         self.complex_columns = state['complex_columns']
         self.path = state['path']
+        self.partitions = state.get('partitions', set([]))
+
         self.db_name = state['db_name']
         self.db_name = os.path.dirname(self.path)
         self.table_name = os.path.basename(self.db_name)
         self._cached_chunk_files = None
         self.special_types = state['special_types']
+
+        self.last_partition_start = 0
         self._last_modified_time = None
         self.has_extra_columns_view = None
         self.thread_executor = ThreadPoolExecutor(NUM_THREADS)
@@ -1130,9 +1137,24 @@ class SQLDataFrameWrapper:
                 self.logger.exception('Error while closing cursor')
 
     def _partition_add(self, partition_start, partition_end):
-        statement = f"""CREATE TABLE {self.table_name}_{uuid_safe()} PARTITION OF {self.table_name} FOR VALUES FROM
-            ({partition_start}) TO ({partition_end})"""
-        self._execute_command_dbapi(statement)
+
+        if (partition_start, partition_end) not in self.partitions:
+            partition_name = f"{self.table_name}_{uuid_safe()}"
+            statement = f"""CREATE TABLE {partition_name} PARTITION OF {self.table_name} FOR VALUES FROM
+                ({partition_start}) TO ({partition_end})"""
+
+            self.partitions.add((partition_start, partition_end))
+            self._execute_command_dbapi(statement)
+            self._partition_and_index_table(partition_name, self.simple_columns)
+
+
+    def partitions_prepare(self, simple_columns_df):
+        temp = simple_columns_df[['chunking_index']].copy()
+        partition_chunk_size = self.chunk_size * 100
+        temp['partition_chunk_id'] = temp['chunking_index'].apply(lambda x: int(np.floor(x / partition_chunk_size)))
+        for chunk_id, chunk in temp.groupby(['partition_chunk_id'], group_keys=True, as_index=False):
+            chunk_id = chunk_id[0]
+            self._partition_add(chunk_id * partition_chunk_size, (chunk_id + 1) * partition_chunk_size)
 
 
     def _store_data(self, df, append=False):
@@ -1163,11 +1185,12 @@ class SQLDataFrameWrapper:
 
                     simple_columns_df = simple_columns_df[simple_columns]
                     start = time.time()
-                    self._partition_add(simple_columns_df.chunking_index.min(), simple_columns_df.chunking_index.max() + 1)
+
+                    self.partitions_prepare(df)
                     psql_insert_copy(f"{self.table_name}", conn, simple_columns, simple_columns_df)
                     #simple_columns_df.to_sql(f"{self.table_name}", conn,  index=False, if_exists='append', method=psql_insert_copy)
                     end = time.time()
-                    logger.info(f'Inserted {len(simple_columns_df)} rows into db, it took {(end - start) * 1000} ms')
+                    logger.debug(f'Inserted {len(simple_columns_df)} rows into db, it took {(end - start) * 1000} ms')
 
 
             with self.append_lock:
@@ -1269,9 +1292,9 @@ class SQLDataFrameWrapper:
         try:
             logger = logging.getLogger(__name__)
             s = time.time()
-            df['chunking_index'] = df.core_index.values.astype(np.int32)
+            df['chunking_index'] = df.core_index.values.astype(np.int64)
             e = time.time()
-            logger.info(f'Adding chunking index took: {(e - s) * 1000} ms')
+            logger.debug(f'Adding chunking index took: {(e - s) * 1000} ms')
 
             self._store_data(df, append=True)
         except Exception as exc:
@@ -1304,7 +1327,7 @@ class SQLDataFrameWrapper:
         INNER JOIN {temp_table_name} ON {self.table_name}.chunking_index = {temp_table_name}.chunking_index
         """
         end = time.time()
-        self.logger.info(f'Joining tmp_chunking_indices with data took: {(end - start) * 1000} ms')
+        self.logger.debug(f'Joining tmp_chunking_indices with data took: {(end - start) * 1000} ms')
 
         df_simple = pd.read_sql(query, conn)
         df_simple = self._restore_types(df_simple)
@@ -1428,14 +1451,14 @@ class SQLDataFrameWrapper:
                 cached_chunk = cached_chunk[self.complex_columns]
                 required_rows.append(cached_chunk)
                 pbar.update(1)
-        self.logger.info(f'Chunk pkl fetch duration: {(time.time() - s) * 1000} ms')
+        self.logger.debug(f'Chunk pkl fetch duration: {(time.time() - s) * 1000} ms')
         if len(required_rows) > 0:
             matching_cols = list(set(self.simple_columns) & set(simple_df.columns.values))
             result_df = pd.concat(required_rows).drop_duplicates(subset=['chunking_index'])
             result_df = result_df.merge(simple_df[matching_cols], on = ['chunking_index', 'chunk_id'])
         else:
             result_df = simple_df[self.simple_columns]
-        self.logger.info(f'Chunk pkl fetch duration after merge: {(time.time() - s) * 1000} ms')
+        self.logger.debug(f'Chunk pkl fetch duration after merge: {(time.time() - s) * 1000} ms')
         return result_df
 
     def _preload_all_chunks(self):
@@ -1466,17 +1489,14 @@ class SQLDataFrameWrapper:
 
 
 
-    @classmethod
-    def _partition_and_index_table(cls, table_name, conn, simple_columns):
+    def _partition_and_index_table(self, table_name, simple_columns):
         # First, alter the table to declare it as partitioned
         # Create indexes
-        cursor = conn.cursor()
-
         for col_name in ['chunking_index', 'chunk_id', 'core_index', 'file_name', 'type', 'cluster', 'cluster_global', 'id', 'cluster_id_size', 'cluster_id_size_global']:
             if col_name in simple_columns:
                 index_name = f"{table_name}_{col_name}_idx"
                 create_index_query = f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} ({col_name});"
-                cursor.execute(create_index_query)
+                self._execute_command_dbapi(create_index_query)
 
 
     def commit(self):
@@ -1488,7 +1508,7 @@ class SQLDataFrameWrapper:
         self.logger.info('Commited thread pool, it finished')
         self.thread_executor = ThreadPoolExecutor(NUM_THREADS)
         conn = self.connection.raw_connection()
-        SQLDataFrameWrapper._partition_and_index_table(self.table_name, conn, self.simple_columns)
+        self._partition_and_index_table(self.table_name, self.simple_columns)
 
     def __setitem__(self, key, value):
 
