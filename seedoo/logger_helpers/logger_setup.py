@@ -141,6 +141,7 @@ def initialize_logger():
     if add_stdout:
         stdout_handler = logging.StreamHandler(sys.stdout)
         stdout_handler.setFormatter(formatter)
+        stdout_handler.addFilter(WebsocketFilter())
         logger.addHandler(stdout_handler)
 
     syslog_address = '/var/run/syslog' if platform.system() == 'Darwin' else '/dev/log'
