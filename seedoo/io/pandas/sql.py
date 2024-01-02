@@ -25,6 +25,7 @@ import sqlite3
 import pandas as pd
 import os
 import pickle
+from sqlalchemy import inspect as sql_inspect
 import numpy as np
 import re
 import inspect
@@ -481,7 +482,7 @@ class SQLDataFrameWrapper:
                 col_idx = None
                 return self.wrapper._iloc_method(row_idx, col_idx)
 
-    def __init__(self, df=None, db_name="database.db", table_name = None, path = os.getcwd(), chunk_size = 1000):
+    def __init__(self, df=None, db_name="database.db", table_name = None, path = os.getcwd(), chunk_size = 100):
         self.db_name = os.path.dirname(path)
         if table_name is not None:
             self.table_name = table_name
@@ -834,7 +835,7 @@ class SQLDataFrameWrapper:
                 as a  WHERE not exists(select {unique_constraint} from {self.table_name}
                  where a.{unique_constraint} = {self.table_name}.{unique_constraint}) limit 1"""
 
-            p = pd.read_sql(partition_range_query, conn)
+            p = pd.read_sql(partition_range_query, self.connection)
             p.dropna(inplace = True)
 
             if len(p) > 0:
@@ -1136,58 +1137,101 @@ class SQLDataFrameWrapper:
             except Exception as exc:
                 self.logger.exception('Error while closing cursor')
 
-    def _partition_add(self, partition_start, partition_end):
+    def _partition_add(self, partition_start, partition_end, table_name = None):
 
-        if (partition_start, partition_end) not in self.partitions:
-            partition_name = f"{self.table_name}_{uuid_safe()}"
-            statement = f"""CREATE TABLE {partition_name} PARTITION OF {self.table_name} FOR VALUES FROM
+        if table_name is None:
+            table_name = self.table_name
+
+        if (table_name, partition_start, partition_end) not in self.partitions:
+            partition_name = f"{table_name}_{uuid_safe()}"
+            statement = f"""CREATE TABLE {partition_name} PARTITION OF {table_name} FOR VALUES FROM
                 ({partition_start}) TO ({partition_end})"""
+            self.partitions.add((table_name, partition_start, partition_end))
 
-            self.partitions.add((partition_start, partition_end))
-            self._execute_command_dbapi(statement)
+            try:
+                self._execute_command_dbapi(statement)
+            except psycopg2.errors.InvalidObjectDefinition as e:
+                message = e.args[0]
+                self.logger.warning(f'Could not create partition for range: {(partition_start, partition_end)} because it probably overlaps, error was: {message}')
+
             self._partition_and_index_table(partition_name, self.simple_columns)
 
 
-    def partitions_prepare(self, simple_columns_df):
+    def partitions_prepare(self, simple_columns_df, table_name = None):
+        if table_name is None:
+            table_name = self.table_name
+
         temp = simple_columns_df[['chunking_index']].copy()
-        partition_chunk_size = self.chunk_size * 100
+        partition_chunk_size = self.chunk_size * 1000
         temp['partition_chunk_id'] = temp['chunking_index'].apply(lambda x: int(np.floor(x / partition_chunk_size)))
         for chunk_id, chunk in temp.groupby(['partition_chunk_id'], group_keys=True, as_index=False):
             chunk_id = chunk_id[0]
-            self._partition_add(chunk_id * partition_chunk_size, (chunk_id + 1) * partition_chunk_size)
+            self._partition_add(chunk_id * partition_chunk_size, (chunk_id + 1) * partition_chunk_size, table_name)
+
+    def core_columns(self, df):
+        cols = [c for c in self.core_column_names if c in df.columns]
+        return df[cols]
+
+    @property
+    def core_column_names(self):
+        return ['bbox', 'chunking_index', 'chunk_id', 'file_name', 'cluster', 'cluster_level_zero', 'cluster_global', 'type', 'id']
+
+    @property
+    def extra_fields_table_name(self):
+        return f'{self.table_name}_by_id_more_fields'
 
 
     def _store_data(self, df, append=False):
         logger = logging.getLogger(__name__)
         try:
+            df = df.copy()
             df['chunk_id'] = df['chunking_index'].apply(lambda x: int(np.floor(x / self.chunk_size)))
             _simple_columns, complex_columns, special_types = SQLDataFrameWrapper.identify_column_types(df)
             self.special_types.update(special_types)
             simple_columns_df = df[_simple_columns]
+            simple_columns = list(set(simple_columns_df.columns.values) & set(self.simple_columns) - set(self.core_column_names) | set(['id']))
+            simple_columns = [c for c in simple_columns if c != 'chunk_id']
+            simple_columns = sorted(simple_columns)
 
             with self.append_lock:
                 # Save simple columns to SQLite
                 conn = self.connection
                 if not append:
+                    template_table = f"{self.extra_fields_table_name}_template"
+                    df_core = self.core_columns(simple_columns_df)
+                    simple_columns = [c for c in simple_columns if c != 'chunk_id']
+                    simple_columns_df[simple_columns].head(0).to_sql(f"{template_table}", conn, index=False, if_exists="replace")
+
+                    self._execute_command_dbapi(f"DROP TABLE IF EXISTS  {self.extra_fields_table_name}")
+                    partition_clause = f"""CREATE TABLE {self.extra_fields_table_name} (LIKE {template_table} INCLUDING ALL)"""
+                    #PARTITION BY RANGE (chunking_index)"""
+                    self._execute_command_dbapi(partition_clause)
+                    self._execute_command_dbapi(f"drop table {template_table}")
+
+
                     template_table = f"{self.table_name}_template"
-                    simple_columns_df.head(0).to_sql(f"{template_table}", conn, index=False, if_exists="replace")
+                    df_core.head(0).to_sql(f"{template_table}", conn, index=False, if_exists="replace")
 
                     self._execute_command_dbapi(f"DROP TABLE IF EXISTS  {self.table_name}")
                     partition_clause = f"""CREATE TABLE {self.table_name} (LIKE {template_table} INCLUDING ALL) PARTITION BY RANGE (chunking_index)"""
                     self._execute_command_dbapi(partition_clause)
                     self._execute_command_dbapi(f"drop table {template_table}")
+
                     append = True
 
                 if append:
-                    simple_columns = list(set(simple_columns_df.columns.values) & set(self.simple_columns))
-                    if 'chunk_id' not in simple_columns:
-                        simple_columns.append('chunk_id')
+                    #simple_columns = list(set(simple_columns_df.columns.values) & set(self.simple_columns))
 
                     simple_columns_df = simple_columns_df[simple_columns]
                     start = time.time()
 
-                    self.partitions_prepare(df)
-                    psql_insert_copy(f"{self.table_name}", conn, simple_columns, simple_columns_df)
+                    #self.partitions_prepare(simple_columns_df, table_name=self.extra_fields_table_name)
+
+                    psql_insert_copy(self.extra_fields_table_name, conn, simple_columns, simple_columns_df.drop_duplicates(subset = ['id']))
+                    df_core = self.core_columns(df)
+                    self.partitions_prepare(df_core)
+                    psql_insert_copy(f"{self.table_name}", conn, df_core.columns.values.tolist(),
+                                     df_core)
                     #simple_columns_df.to_sql(f"{self.table_name}", conn,  index=False, if_exists='append', method=psql_insert_copy)
                     end = time.time()
                     logger.debug(f'Inserted {len(simple_columns_df)} rows into db, it took {(end - start) * 1000} ms')
@@ -1492,11 +1536,17 @@ class SQLDataFrameWrapper:
     def _partition_and_index_table(self, table_name, simple_columns):
         # First, alter the table to declare it as partitioned
         # Create indexes
-        for col_name in ['chunking_index', 'chunk_id', 'core_index', 'file_name', 'type', 'cluster', 'cluster_global', 'id', 'cluster_id_size', 'cluster_id_size_global']:
+        def column_exists(engine, table_name, column_name):
+            inspector = sql_inspect(engine)
+            columns = inspector.get_columns(table_name)
+            return any(col['name'] == column_name for col in columns)
+
+        for col_name in ['chunking_index', 'chunk_id', 'file_name', 'type', 'cluster', 'cluster_global', 'id', 'cluster_id_size', 'cluster_id_size_global']:
             if col_name in simple_columns:
-                index_name = f"{table_name}_{col_name}_idx"
-                create_index_query = f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} ({col_name});"
-                self._execute_command_dbapi(create_index_query)
+                if column_exists(self.connection, table_name, col_name):
+                    index_name = f"{table_name}_{col_name}_idx"
+                    create_index_query = f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} ({col_name});"
+                    self._execute_command_dbapi(create_index_query)
 
 
     def commit(self):
@@ -1715,11 +1765,13 @@ class SQLDataFrameWrapper:
         if self.has_view:
             table_name_for_select = view_name
 
+        if query_str:
+            query_str = f"WHERE {query_str}"
         if start is not None and stop is not None:
-            full_query = f"SELECT {from_clause} FROM  {table_name_for_select} WHERE {query_str}  {extra} LIMIT {stop} OFFSET {start}"
+            full_query = f"SELECT {from_clause} FROM  {table_name_for_select} {query_str}  {extra} LIMIT {stop} OFFSET {start}"
             result = self._inner_query(full_query, with_complex)
         else:
-            full_query = f"SELECT {from_clause} FROM {table_name_for_select} WHERE {query_str} {extra} asc"
+            full_query = f"SELECT {from_clause} FROM {table_name_for_select} {query_str} {extra} asc"
             result = self._inner_query(full_query, with_complex)
 
         end = time.time()
@@ -1830,6 +1882,7 @@ def generate_dataframe(start_index = 0, n_rows=20_000):
 
     # Construct the DataFrame
     df = pd.DataFrame({
+        'id' : np.arange(0, n_rows, 1),
         'a' : string_col,
         'b': string_col,
         'd' : string_col,
