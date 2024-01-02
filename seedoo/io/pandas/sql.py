@@ -76,6 +76,12 @@ def caller_info():
 
     return "No external caller found"
 
+
+def column_exists(engine, table_name, column_name):
+    inspector = sql_inspect(engine)
+    columns = inspector.get_columns(table_name)
+    return any(col['name'] == column_name for col in columns)
+
 def psql_insert_copy(table_name, conn, keys, data_iter):
     # Create a MetaData instance
     metadata = MetaData()
@@ -489,6 +495,8 @@ class SQLDataFrameWrapper:
         else:
             self.table_name = os.path.basename(self.db_name)
 
+
+        self._core_columns = []
         #os.path.join(path, db_name)
         self.complex_columns = []
         self.partitions = set([])
@@ -864,92 +872,6 @@ class SQLDataFrameWrapper:
         """
         self.upsert(df)
         provided_simple_cols, provided_complex_cols, special_types = self.identify_column_types(df)
-
-        if False:
-            df = df.copy()
-            if "index" in df:
-                del df['index']
-
-            self._simple_columns = None
-
-            # Step 1: Identify simple and complex columns in the provided dataframe
-            provided_simple_cols, provided_complex_cols, special_types = self.identify_column_types(df)
-            self.special_types.update(special_types)
-            existing_column_names = self.simple_columns
-
-            # Step 2: Identify new columns compared to existing data
-
-            update_cols = [col for col in df.columns if col in existing_column_names if
-                           col not in ['chunking_index', 'chunk_id']]
-            insert_cols = [col for col in df.columns if col not in existing_column_names]
-
-            columns_to_use = list(set(self.simple_columns) - (set(provided_simple_cols) - set(['chunking_index', 'chunk_id'])))
-            common_columns = set(provided_simple_cols) & set(existing_column_names)
-            columns_to_use = list(set(columns_to_use) - set(insert_cols) - set(update_cols))
-
-            coalesce_expressions = [f'COALESCE(b."{col}", a."{col}") AS "{col}"' for col in common_columns if col != 'chunking_index' and col != 'chunk_id' and col not in insert_cols]
-            if len(coalesce_expressions) > 0:
-                coalesce_expressions = ",".join(coalesce_expressions)
-                extra = ", "
-            else:
-                coalesce_expressions = ''
-                extra = ""
-
-            if len(columns_to_use) > 0:
-                columns_to_use = ", ".join([f'a."{col}" as "{col}"' for col in columns_to_use if
-                                         col != 'chunking_index' and col != 'chunk_id'])
-
-                columns_to_use =  f"{extra} {columns_to_use}"
-                extra = ", "
-            if len(insert_cols) > 0:
-                insert_cols = ", ".join([f'b."{col}" as "{col}"' for col in provided_simple_cols if col != 'chunking_index' and col != 'chunk_id' and col in insert_cols])
-                insert_cols = f"{extra} {insert_cols}"
-            else:
-                insert_cols = ''
-
-            conn = self.connection
-            # Step 3: Insert the new DataFrame into a temporary table
-            self.logger.debug(f'Inserting df of length {len(df)} into temp table for update')
-            temp_table_name = f'temp_new_{self.table_name}_{str(uuid.uuid1()).replace("-", "")}'
-            temp_table_name = temp_table_name.replace("_", "")[0:60]
-            with self.append_lock:
-                cursor = conn.raw_connection().cursor()
-
-                cursor.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
-
-                df[provided_simple_cols].to_sql(temp_table_name, conn, if_exists='replace', index=False, method=psql_insert_copy, chunksize = 1_000_000)
-
-                self.logger.info(f'Creating index for temp table on bulk insert')
-                # Step 6: Re-add indices to the new data table
-                cursor.execute(f"CREATE INDEX chunking_index_idx_{temp_table_name} ON {temp_table_name} (chunking_index)")
-                self.logger.info(f'Done creating index for temp table on bulk insert')
-
-            if swap:
-                with self.append_lock:
-                    cursor.execute(f"DROP TABLE {self.table_name}")
-                    cursor.execute(f"ALTER TABLE {temp_table_name} RENAME TO {self.table_name}")
-                    conn.raw_connection().commit()
-            else:
-                self.logger.info(f'Joining temp table with main table for update')
-                # Step 4: Join the temp table with the main data table
-                cursor.execute(f"""
-                    CREATE TABLE temp_combined_{self.table_name} AS
-                    SELECT a.chunking_index as chunking_index, a.chunk_id as chunk_id {extra} {coalesce_expressions} {columns_to_use} {insert_cols}
-                    FROM {self.table_name} AS a
-                    LEFT JOIN {temp_table_name} AS b
-                    ON a.chunking_index = b.chunking_index
-                """)
-
-                # Step 5: Swap tables
-                self.logger.info(f'Dropping {self.table_name} and renaming the temp table')
-
-                with self.append_lock:
-                    cursor.execute(f"DROP TABLE {self.table_name}")
-                    cursor.execute(f"ALTER TABLE  temp_combined_{self.table_name} RENAME TO {self.table_name}")
-                    SQLDataFrameWrapper._partition_and_index_table(self.table_name, conn.raw_connection(), self.simple_columns)
-                    conn.raw_connection().commit()
-
-            self.logger.info('Creating indexes')
         remaining_complex_columns = set(provided_complex_cols) - set(["chunking_index", "chunk_id"])
 
         if remaining_complex_columns:
@@ -1174,7 +1096,10 @@ class SQLDataFrameWrapper:
 
     @property
     def core_column_names(self):
-        return ['bbox', 'chunking_index', 'chunk_id', 'file_name', 'cluster', 'cluster_level_zero', 'cluster_global', 'type', 'id']
+        basic = ['bbox', 'chunking_index', 'chunk_id', 'file_name', 'cluster', 'cluster_level_zero', 'cluster_global', 'type', 'id']
+        return basic
+
+
 
     @property
     def extra_fields_table_name(self):
@@ -1202,7 +1127,7 @@ class SQLDataFrameWrapper:
                     simple_columns = [c for c in simple_columns if c != 'chunk_id']
                     simple_columns_df[simple_columns].head(0).to_sql(f"{template_table}", conn, index=False, if_exists="replace")
 
-                    self._execute_command_dbapi(f"DROP TABLE IF EXISTS  {self.extra_fields_table_name}")
+                    self._execute_command_dbapi(f"DROP  TABLE IF EXISTS  {self.extra_fields_table_name} CASCADE ")
                     partition_clause = f"""CREATE TABLE {self.extra_fields_table_name} (LIKE {template_table} INCLUDING ALL)"""
                     #PARTITION BY RANGE (chunking_index)"""
                     self._execute_command_dbapi(partition_clause)
@@ -1212,7 +1137,7 @@ class SQLDataFrameWrapper:
                     template_table = f"{self.table_name}_template"
                     df_core.head(0).to_sql(f"{template_table}", conn, index=False, if_exists="replace")
 
-                    self._execute_command_dbapi(f"DROP TABLE IF EXISTS  {self.table_name}")
+                    self._execute_command_dbapi(f"DROP TABLE  IF EXISTS  {self.table_name} CASCADE")
                     partition_clause = f"""CREATE TABLE {self.table_name} (LIKE {template_table} INCLUDING ALL) PARTITION BY RANGE (chunking_index)"""
                     self._execute_command_dbapi(partition_clause)
                     self._execute_command_dbapi(f"drop table {template_table}")
@@ -1536,17 +1461,92 @@ class SQLDataFrameWrapper:
     def _partition_and_index_table(self, table_name, simple_columns):
         # First, alter the table to declare it as partitioned
         # Create indexes
-        def column_exists(engine, table_name, column_name):
-            inspector = sql_inspect(engine)
-            columns = inspector.get_columns(table_name)
-            return any(col['name'] == column_name for col in columns)
-
         for col_name in ['chunking_index', 'chunk_id', 'file_name', 'type', 'cluster', 'cluster_global', 'id', 'cluster_id_size', 'cluster_id_size_global']:
             if col_name in simple_columns:
                 if column_exists(self.connection, table_name, col_name):
                     index_name = f"{table_name}_{col_name}_idx"
                     create_index_query = f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} ({col_name});"
                     self._execute_command_dbapi(create_index_query)
+
+
+
+    def drop_views(self):
+        more_view = f"""
+            drop view if exists  {self.table_name}_view CASCADE ;
+            drop view if exists vw_chunking_index_taxonomy_{self.table_name}_view CASCADE; 
+            drop view if exists {self.table_name}_view_with_extra_fields CASCADE;
+            drop view if exists {self.table_name}_partial_view CASCADE;
+            """
+
+        self._execute_command_dbapi(more_view)
+
+    def _model_extra_fields_table_create(self):
+        query = f"""
+        create table if not exists {self.table_name}_with_extra_columns
+            (
+                chunking_index  bigint,
+                prob            double precision default '-1.0'::numeric,
+                prob_vat        double precision default '-1.0'::numeric,
+                prob_delta_vat  double precision default '-1.0'::numeric,
+                vat_changed boolean          default false,
+                prob_delta      double precision default '-1.0'::numeric,
+                prob_vat_delta  double precision default '-1.0'::numeric,
+                inspect         boolean          default false,
+                tagged          boolean          default false,
+                model           varchar,
+                timestamp       timestamp default CURRENT_TIMESTAMP 
+            );
+        
+        """
+        indx = f"""CREATE INDEX IF NOT EXISTS chunking_index_idx_extra_{self.table_name} ON {self.table_name}_with_extra_columns (chunking_index);"""
+        self._execute_command_dbapi(query)
+        self._execute_command_dbapi(indx)
+        self.drop_views()
+
+        more_view = f"""
+            DO $$
+            DECLARE
+                _sql TEXT;
+            BEGIN
+                SELECT 'SELECT l.model, l.source, l.timestamp, l.chunking_index, ' || STRING_AGG('MAX(CASE WHEN l.taxonomy = ''' || taxonomy || ''' THEN l.value END) AS "' || taxonomy || '"', ', ')
+                INTO _sql
+                FROM (SELECT DISTINCT taxonomy FROM latest_labels_view) t;
+            
+                _sql := _sql || ' FROM latest_labels_view l RIGHT JOIN {self.table_name} w ON l.chunking_index = w.chunking_index WHERE l.index_name = ''{self.table_name}''  GROUP BY l.chunking_index, l.model, l.source, l.timestamp';
+            
+                EXECUTE 'CREATE OR REPLACE VIEW vw_chunking_index_taxonomy_{self.table_name}_view AS ' || _sql;
+            END $$;
+            
+            DO $$
+            DECLARE
+                column_list TEXT;
+            BEGIN
+                -- Retrieve column names except 'chunking_index'
+                SELECT STRING_AGG(column_name, ', ') INTO column_list
+                FROM information_schema.columns
+                WHERE table_schema = 'public' -- Replace with your actual schema name if not public
+                AND table_name = 'vw_chunking_index_taxonomy_{self.table_name}_view'
+                AND column_name <> 'chunking_index';
+            
+                -- Construct and execute dynamic SQL
+                EXECUTE 'CREATE OR REPLACE VIEW {self.table_name}_view_with_extra_fields AS
+                         SELECT a.*, ' || column_list || '
+                         FROM {self.table_name} AS a
+                         LEFT JOIN vw_chunking_index_taxonomy_{self.table_name}_view AS b
+                         ON a.chunking_index = b.chunking_index';
+            END $$;
+            """
+
+
+        self._execute_command_dbapi(more_view)
+
+        final_view = f"""
+            create or replace view {self.table_name}_partial_view as select a.*, b.vat_changed, b.prob_vat_delta, b.prob,  b.tagged, b.prob_vat, b.prob_delta,b.inspect from {self.table_name}_view_with_extra_fields as a  left join {self.table_name}_with_extra_columns as b
+            on a.chunking_index = b.chunking_index;
+        """
+
+        self._execute_command_dbapi(final_view)
+
 
 
     def commit(self):
@@ -1556,6 +1556,16 @@ class SQLDataFrameWrapper:
         self.logger.info('Comitting and closing thread pool , but first waiting for it to finish')
         self.thread_executor.shutdown(wait=False)
         self.logger.info('Commited thread pool, it finished')
+
+        self._model_extra_fields_table_create()
+        core_columns = [c for c in self.core_column_names if column_exists(self.connection, self.table_name, c)]
+        core_columns_select =",".join([f"a.{c}" for c in core_columns if c != "id"])
+
+        view_command = f"""create or replace view {self.table_name}_view as select {core_columns_select}, b.* from {self.table_name}_partial_view as a join {self.extra_fields_table_name} as b
+            on b.id = a.id
+            """
+
+        self._execute_command_dbapi(view_command)
         self.thread_executor = ThreadPoolExecutor(NUM_THREADS)
         conn = self.connection.raw_connection()
         self._partition_and_index_table(self.table_name, self.simple_columns)
