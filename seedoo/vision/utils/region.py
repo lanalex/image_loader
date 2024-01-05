@@ -553,12 +553,16 @@ class Region:
 
         original_columns.append("region_group")
         original_columns.append('region_group_score_median')
-        grouped_df['region_group_score_median'] = grouped_df.groupby(['region_group'])[score_column].transform('mean')
+        grouped_df['region_group_score_median'] = grouped_df.groupby(['region_group'])[score_column].transform('min')
         grouped_df['region_column'] = grouped_df['bbox'].apply(lambda x: Region.from_xywh(*x))
         #grouped_df = grouped_df[grouped_df['region_group_score_median'] >= grouped_df[score_column].max() * 0.7]
 
         ix = grouped_df['region_group_score_median'].idxmax()
+        ix = np.unique(ix).max()
         best_group = grouped_df.loc[ix].region_group
+        if isinstance(best_group, pd.Series):
+            best_group = best_group.values[0]
+
         filtered_regions = grouped_df[grouped_df['region_group'] == best_group].region_column.values.tolist()
 
         # Combine the selected bounding boxes into a new bounding box
@@ -572,7 +576,8 @@ class Region:
 
         combined_bbox = (new_left, new_top, new_width, new_height)
 
-        return combined_bbox, grouped_df[original_columns]
+        final = grouped_df[grouped_df['region_group'] == best_group]
+        return combined_bbox, final[original_columns]
 
     @staticmethod
     def group_regions_df(df: pd.DataFrame, coordinate_columns=['xmin', 'ymin', 'xmax', 'ymax'],
