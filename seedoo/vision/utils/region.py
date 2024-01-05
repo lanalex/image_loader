@@ -620,7 +620,6 @@ class Region:
                     max_diagonal_length = max(diagonals[i], diagonals[j])
                     if distance_matrix[i, j] > 0:
                         relative_distance = distance_matrix[i, j] / (2 * max_diagonal_length)
-                        print(distance_matrix[i, j], relative_distance, max_relative_distance)
                         if relative_distance < max_relative_distance:
                             if scores is None or scores[j] > max_score * score_tolerance:
                                 relative_distance_matrix[i, j] = 1
