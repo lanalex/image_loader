@@ -552,11 +552,14 @@ class Region:
                                              max_relative_distance=max_relative_distance, score_column_name=score_column)
 
         original_columns.append("region_group")
+        original_columns.append('region_group_score_median')
         grouped_df['region_group_score_median'] = grouped_df.groupby(['region_group'])[score_column].transform('mean')
         grouped_df['region_column'] = grouped_df['bbox'].apply(lambda x: Region.from_xywh(*x))
         #grouped_df = grouped_df[grouped_df['region_group_score_median'] >= grouped_df[score_column].max() * 0.7]
 
-        filtered_regions = grouped_df.region_column.values.tolist()
+        ix = grouped_df['region_group_score_median'].idxmax()
+        best_group = grouped_df.loc[ix].region_group
+        filtered_regions = grouped_df[grouped_df['region_group'] == best_group].region_column.values.tolist()
 
         # Combine the selected bounding boxes into a new bounding box
         lefts, tops, widths, heights = zip(*[r.to_xywh() for r in filtered_regions])
@@ -615,10 +618,12 @@ class Region:
             if scores is None or (scores[i] >= max_score * score_tolerance):
                 for j in range(len(m)):
                     max_diagonal_length = max(diagonals[i], diagonals[j])
-                    relative_distance = distance_matrix[i, j] / (2 * max_diagonal_length)
-                    if relative_distance < max_relative_distance:
-                        if scores is None or scores[j] > max_score * score_tolerance:
-                            relative_distance_matrix[i, j] = 1
+                    if distance_matrix[i, j] > 0:
+                        relative_distance = distance_matrix[i, j] / (2 * max_diagonal_length)
+                        print(distance_matrix[i, j], relative_distance, max_relative_distance)
+                        if relative_distance < max_relative_distance:
+                            if scores is None or scores[j] > max_score * score_tolerance:
+                                relative_distance_matrix[i, j] = 1
 
         #np.fill_diagonal(relative_distance_matrix, 1)
 
