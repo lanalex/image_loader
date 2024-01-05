@@ -82,53 +82,58 @@ def column_exists(engine, table_name, column_name):
     columns = inspector.get_columns(table_name)
     return any(col['name'] == column_name for col in columns)
 
-def psql_insert_copy(table_name, conn, keys, data_iter):
-    # Create a MetaData instance
-    metadata = MetaData()
+def psql_insert_copy(table_name, conn, keys, data_iter, table = None):
+    try:
+        # Create a MetaData instance
+        metadata = MetaData()
 
-    # Reflect the table from the database
-    if isinstance(table_name, (str,)):
-        table = Table(table_name, metadata, autoload_with=conn)
-        dbapi_conn = conn.raw_connection()
-
-    else:
-        table = table_name
-        dbapi_conn = conn.connection
-
-    # gets a DBAPI connection that can provide a cursor
-
-    logger = logging.getLogger(__name__)
-    with dbapi_conn.cursor() as cur:
-
-        s = time.time()
-        if isinstance(data_iter, pd.DataFrame):
-            #s_buf = to_csv_parallel(data_iter)
-            s_buf = StringIO()
-            data_iter.to_csv(s_buf, index=False, header=False, sep=',', quoting=csv.QUOTE_MINIMAL)
+        # Reflect the table from the database
+        if table is not None:
+            table = table
+            dbapi_conn = conn.connection
+        elif isinstance(table_name, (str,)):
+            table = Table(table_name, metadata, autoload_with=conn)
+            dbapi_conn = conn.raw_connection()
         else:
-            s_buf = StringIO()
-            writer = csv.writer(s_buf)
-            writer.writerows(data_iter)
+            table = table_name
+            dbapi_conn = conn.connection
 
-        e = time.time()
-        logger.debug(f'CSV writer took: {(e-s) * 1000} ms')
+        # gets a DBAPI connection that can provide a cursor
 
-        s_buf.seek(0)
+        logger = logging.getLogger(__name__)
+        with dbapi_conn.cursor() as cur:
+            s = time.time()
+            if isinstance(data_iter, pd.DataFrame):
+                #s_buf = to_csv_parallel(data_iter)
+                s_buf = StringIO()
+                data_iter.to_csv(s_buf, index=False, header=False, sep=',', quoting=csv.QUOTE_MINIMAL)
+            else:
+                s_buf = StringIO()
+                writer = csv.writer(s_buf)
+                writer.writerows(data_iter)
 
-        columns = ', '.join('"{}"'.format(k) for k in keys)
-        if table.schema:
-            table_name = '{}.{}'.format(table.schema, table.name)
-        else:
-            table_name = table.name
+            e = time.time()
+            logger.debug(f'CSV writer took: {(e-s) * 1000} ms')
 
-        sql = 'COPY {} ({}) FROM STDIN WITH CSV'.format(
-                              table_name, columns)
+            s_buf.seek(0)
+
+            columns = ', '.join('"{}"'.format(k) for k in keys)
+            if table.schema:
+                table_name = '{}.{}'.format(table.schema, table.name)
+            else:
+                table_name = table.name
+
+            sql = 'COPY {} ({}) FROM STDIN WITH CSV'.format(
+                                  table_name, columns)
 
 
-        s = time.time()
-        cur.copy_expert(sql=sql, file=s_buf)
-        e = time.time()
-        logger.debug(f'cursor copy_expert took took: {(e-s) * 1000} ms')
+            s = time.time()
+            cur.copy_expert(sql=sql, file=s_buf)
+            e = time.time()
+            logger.debug(f'cursor copy_expert took took: {(e-s) * 1000} ms')
+    except Exception as exc:
+        logging.getLogger(__name__).exception('Errr in insert')
+        raise
 
 def set_pragmas_for_conn(conn):
     """Set optimized pragmas for a sqlite3 connection."""
@@ -528,22 +533,16 @@ class SQLDataFrameWrapper:
         thread_id = 0 % 1
 
         if thread_id not in self._connection:
-            #conn = psycopg2.connect(dbname=f'seedoo',
-            #                                user='seedoo',
-            #                                password='kDASAEspJEdHp7',
-            #                                host='localhost'
-            #                            )
-
             connection_string = f'postgresql+psycopg2://seedoo:kDASAEspJEdHp7@localhost/seedoo'
             conn = create_engine(connection_string, isolation_level="AUTOCOMMIT",
-            pool_size=5,  # Maximum number of permanent connections to keep
-            max_overflow=10,  # Maximum number of overflow connections
+            pool_size=20,  # Maximum number of permanent connections to keep
+            max_overflow=15,  # Maximum number of overflow connections
             pool_timeout=30,  # Timeout for acquiring a connection from the pool
             pool_recycle=1800  # Time in seconds a connection can be reused
             )
             self._connection[thread_id] = conn
 
-            print(f'Total connections: {len(self._connection)}')
+            self.logger.debug(f'Total connections: {len(self._connection)}')
 
         return self._connection[thread_id]
 
@@ -556,8 +555,20 @@ class SQLDataFrameWrapper:
     def __del__(self):
         self.connection.raw_connection().close()
 
+    @property
+    def table_name_for_select(self):
+        table_name_for_select = self.table_name
+        view_name = f"{self.table_name}_view"
+        if self.has_view:
+            table_name_for_select = view_name
+
+        return table_name_for_select
+
     def _loc_method(self, row_labels, col_labels=None):
         # Handle the logic for .loc indexer
+
+        table_name_for_select = self.table_name_for_select
+
         columns_query = None
         if col_labels:
             simple_columns = self.simple_columns
@@ -569,16 +580,16 @@ class SQLDataFrameWrapper:
             columns_query = [c for c in col_labels if c in simple_columns]
 
         if col_labels:
-            columns_query = ",".join([f'{self.table_name}."{c}"' for c in columns_query])
+            columns_query = ",".join([f'{table_name_for_select}."{c}"' for c in columns_query])
         else:
-            columns_query = f"{self.table_name}.*"
+            columns_query = f"{table_name_for_select}.*"
 
         time_start = time.time()
         if row_labels is None:
             # Join the temp table with the main data table on chunking_index
             query = f"""
                 SELECT {columns_query}
-                FROM {self.table_name}
+                FROM {table_name_for_select}
             """
             conn = self.connection
             subset_df = pd.read_sql(query, conn)
@@ -587,7 +598,7 @@ class SQLDataFrameWrapper:
             row_labels_str = ",".join([str(i) for i in row_labels])
             query = f"""
                 SELECT {columns_query}
-                FROM {self.table_name} where chunking_index in ({row_labels_str})
+                FROM {table_name_for_select} where chunking_index in ({row_labels_str})
             """
             subset_df = pd.read_sql(query, self.connection)
         else:
@@ -606,8 +617,8 @@ class SQLDataFrameWrapper:
                 # Join the temp table with the main data table on chunking_index
                 query = f"""
                     SELECT {columns_query}
-                    FROM {self.table_name}
-                    JOIN {temp_table_name} ON {self.table_name}.chunking_index = {temp_table_name}.chunking_index
+                    FROM {table_name_for_select}
+                    JOIN {temp_table_name} ON {table_name_for_select}.chunking_index = {temp_table_name}.chunking_index
                 """
                 subset_df = pd.read_sql(query, self.connection)
 
@@ -786,12 +797,10 @@ class SQLDataFrameWrapper:
 
         # Create a temporary table
         temp_table_name = f"temp_{self.table_name}_{str(uuid.uuid4()).replace('-', '_')}"
-
+        temp_table_name = temp_table_name[0:60]
 
         with self.connection.connect() as connection:
-            connection.autocommit = False
-            transaction = connection.begin()
-
+            connection.autocommit = True
             conn = connection.connection
 
             # Create temporary table with the same structure as the original table
@@ -820,9 +829,11 @@ class SQLDataFrameWrapper:
                 cursor.execute(alter_cmd)
 
             cursor.execute(f"CREATE TABLE {temp_table_name} (LIKE {self.table_name} INCLUDING ALL)")
+            temp_table_reflect = Table(temp_table_name, MetaData(), autoload_with=connection)
 
             # Insert DataFrame into the temporary table
-            df.to_sql(temp_table_name, connection, if_exists='replace', index=False, method=psql_insert_copy, schema = 'public')
+            self.logger.info(f'Inserting into TEMP TABLE: {temp_table_name}, len df: {len(df)}')
+            psql_insert_copy(temp_table_name, connection, df.columns.values, df, table = temp_table_reflect)
             index_name = f'chunking_index_idx_temp_table_{temp_table_name}'
             cursor.execute(
                 f"CREATE INDEX IF NOT EXISTS {index_name} ON {temp_table_name} (chunking_index)")
@@ -856,12 +867,13 @@ class SQLDataFrameWrapper:
 
             cursor.execute(insert_sql)
             cursor.execute(update_sql)
-            transaction.commit()
             cursor.execute(f"DROP INDEX {index_name}")
             cursor.execute(
                 f"DROP TABLE IF EXISTS {temp_table_name}")  # Optionally drop the temp table if not automatically dropped
 
             cursor.close()
+            connection.commit()
+
 
     def update(self, df, swap = False):
         """
@@ -1096,7 +1108,7 @@ class SQLDataFrameWrapper:
 
     @property
     def core_column_names(self):
-        basic = ['bbox', 'chunking_index', 'chunk_id', 'file_name', 'cluster', 'cluster_level_zero', 'cluster_global', 'type', 'id']
+        basic = ['bbox', 'chunking_index', 'label', 'laplacian_variance', 'std', 'chunk_id', 'cluster', 'cluster_level_zero', 'cluster_global', 'type', 'id']
         return basic
 
 
@@ -1481,6 +1493,94 @@ class SQLDataFrameWrapper:
         self._execute_command_dbapi(more_view)
 
     def _model_extra_fields_table_create(self):
+
+        command = """
+                create table if not exists models
+                (
+                    id         serial
+                        constraint models_pk
+                            primary key,
+                    name       varchar,
+                    timestamp  timestamp default now(),
+                    index_name varchar,
+                    type       varchar   default 'single_label_classifier'::character varying
+                );
+                
+                alter table models
+                    owner to seedoo;
+                
+                -- auto-generated definition
+                create sequence if not exists models_id_seq
+                    as integer;
+                
+                alter sequence models_id_seq owner to seedoo;
+                
+                alter sequence models_id_seq owned by models.id;
+                            
+                -- auto-generated definition
+                create table  if not exists  label_definitions
+                (
+                    taxonomy   varchar default 'Undefined'::character varying,
+                    value      varchar default 'Undefined'::character varying,
+                    index_name varchar default 'Undefined'::character varying,
+                    model      varchar default 'basic'::character varying,
+                    id         integer default nextval('label_definitions_id_seq'::regclass) not null
+                );
+                
+                alter table label_definitions
+                    owner to seedoo;
+                
+                -- auto-generated definition
+                create sequence if not exists label_definitions_id_seq;
+                alter sequence label_definitions_id_seq owner to seedoo;
+                
+                -- auto-generated definition
+                create table if not exists  labels
+                (
+                    taxonomy       varchar   default 'Undefined'::character varying,
+                    value          varchar   default 'Undefined'::character varying,
+                    index_name     varchar   default 'Undefined'::character varying,
+                    chunking_index integer   default '-1'::integer,
+                    file_name      varchar,
+                    timestamp      timestamp default CURRENT_TIMESTAMP,
+                    source         varchar   default 'human'::character varying,
+                    model          varchar   default 'basic'::character varying
+                );
+                
+                alter table labels
+                    owner to seedoo;
+                    
+                create or replace view latest_labels_view as
+                WITH LatestLabels AS (
+                    SELECT
+                        chunking_index,
+                        taxonomy,
+                        timestamp,
+                        model,
+                        index_name,
+                        file_name,
+                        source,
+                        value,
+                        ROW_NUMBER() OVER (PARTITION BY chunking_index, taxonomy, index_name, source ORDER BY timestamp DESC) as rn
+                    FROM labels
+                )
+                SELECT chunking_index, taxonomy, value, source, timestamp, index_name, model
+                FROM LatestLabels
+                WHERE rn = 1;
+        """
+        self._execute_command_dbapi(command)
+
+        self._execute_command_dbapi(f"delete from models where index_name = '{self.table_name}'")
+        self._execute_command_dbapi(f"delete from seedoo.public.label_definitions where index_name = '{self.table_name}'")
+
+        row1 = {'index_name' : self.table_name, 'name' : 'default' , 'type' : 'classifier'}
+        pd.DataFrame([row1]).to_sql('models', self.connection, if_exists = 'append', index = False)
+
+        row1 = {'index_name' : self.table_name, 'model' : 'default', 'taxonomy' : 'good', 'value' : 'yes'}
+        row2 = {'index_name': self.table_name, 'model': 'default', 'taxonomy': 'good', 'value': 'no'}
+        pd.DataFrame([row1, row2]).to_sql('label_definitions', self.connection, if_exists = 'append', index = False)
+
+
         query = f"""
         create table if not exists {self.table_name}_with_extra_columns
             (
@@ -1503,41 +1603,48 @@ class SQLDataFrameWrapper:
         self._execute_command_dbapi(indx)
         self.drop_views()
 
+
+    def pivovted_views_update(self):
+        self.drop_views()
         more_view = f"""
-            DO $$
-            DECLARE
-                _sql TEXT;
-            BEGIN
-                SELECT 'SELECT l.model, l.source, l.timestamp, l.chunking_index, ' || STRING_AGG('MAX(CASE WHEN l.taxonomy = ''' || taxonomy || ''' THEN l.value END) AS "' || taxonomy || '"', ', ')
-                INTO _sql
-                FROM (SELECT DISTINCT taxonomy FROM latest_labels_view) t;
-            
-                _sql := _sql || ' FROM latest_labels_view l RIGHT JOIN {self.table_name} w ON l.chunking_index = w.chunking_index WHERE l.index_name = ''{self.table_name}''  GROUP BY l.chunking_index, l.model, l.source, l.timestamp';
-            
-                EXECUTE 'CREATE OR REPLACE VIEW vw_chunking_index_taxonomy_{self.table_name}_view AS ' || _sql;
-            END $$;
-            
-            DO $$
-            DECLARE
-                column_list TEXT;
-            BEGIN
-                -- Retrieve column names except 'chunking_index'
-                SELECT STRING_AGG(column_name, ', ') INTO column_list
-                FROM information_schema.columns
-                WHERE table_schema = 'public' -- Replace with your actual schema name if not public
-                AND table_name = 'vw_chunking_index_taxonomy_{self.table_name}_view'
-                AND column_name <> 'chunking_index';
-            
-                -- Construct and execute dynamic SQL
-                EXECUTE 'CREATE OR REPLACE VIEW {self.table_name}_view_with_extra_fields AS
-                         SELECT a.*, ' || column_list || '
-                         FROM {self.table_name} AS a
-                         LEFT JOIN vw_chunking_index_taxonomy_{self.table_name}_view AS b
-                         ON a.chunking_index = b.chunking_index';
-            END $$;
+                    DO $$
+                    DECLARE
+                        _sql TEXT;
+                    BEGIN
+                        -- Construct the SELECT part of the SQL statement with dynamic column names
+                        SELECT 'SELECT l.model, l.source, l.timestamp, l.chunking_index, ' || STRING_AGG('MAX(CASE WHEN l.taxonomy = ''' || t.taxonomy || ''' THEN l.value END) AS "' || 'model.' || t.model || '.' || t.taxonomy || '"', ', ')
+                        INTO _sql
+                        FROM (SELECT DISTINCT taxonomy, model FROM label_definitions WHERE index_name = '{self.table_name}') as t;
+                                            
+                        -- Construct the FROM and GROUP BY part of the SQL statement
+                        _sql := _sql || ' FROM latest_labels_view l RIGHT JOIN {self.table_name} w ON l.chunking_index = w.chunking_index WHERE l.index_name = ''{self.table_name}''  GROUP BY l.chunking_index, l.model, l.source, l.timestamp';
+                    
+                        -- Create or replace the view with the constructed SQL
+                        EXECUTE 'CREATE OR REPLACE VIEW vw_chunking_index_taxonomy_{self.table_name}_view AS ' || _sql;
+                    END $$;
+                    
+                    DO $$
+                    DECLARE
+                        column_list TEXT;
+                    BEGIN
+                        -- Retrieve column names except 'chunking_index'
+                        SELECT STRING_AGG('"' || column_name || '"', ', ') INTO column_list
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public' -- Replace with your actual schema name if not public
+                        AND table_name = 'vw_chunking_index_taxonomy_{self.table_name}_view'
+                        AND column_name <> 'chunking_index';
+                    
+                        -- Construct and execute dynamic SQL for the final view
+                        EXECUTE 'CREATE OR REPLACE VIEW {self.table_name}_view_with_extra_fields AS
+                                 SELECT a.*, ' || column_list || '
+                                 FROM {self.table_name} AS a
+                                 LEFT JOIN vw_chunking_index_taxonomy_{self.table_name}_view AS b
+                                 ON a.chunking_index = b.chunking_index';
+                    END $$;
+
             """
 
-
+        print(more_view)
         self._execute_command_dbapi(more_view)
 
         final_view = f"""
@@ -1546,6 +1653,22 @@ class SQLDataFrameWrapper:
         """
 
         self._execute_command_dbapi(final_view)
+
+        core_columns = [c for c in self.core_column_names if column_exists(self.connection, self.table_name, c)]
+        core_columns_select =",".join([f"a.\"{c}\"" for c in core_columns if c != "id"])
+
+        partial_df = pd.read_sql(f"select * from {self.table_name}_partial_view limit 1", self.connection)
+        partial_columns = set(partial_df.columns.values)
+        extra_fields_columns = pd.read_sql(f"select * from {self.extra_fields_table_name} limit 1", self.connection)
+        extra_fields_columns = set(extra_fields_columns.columns.values)
+        partial_columns = partial_columns - extra_fields_columns - set(core_columns)
+        partial_columns = ",".join([f"a.\"{c}\"" for c in partial_columns])
+
+        view_command = f"""create or replace view {self.table_name}_view as select {core_columns_select}, {partial_columns}, b.* from {self.table_name}_partial_view as a join {self.extra_fields_table_name} as b
+            on b.id = a.id
+            """
+
+        self._execute_command_dbapi(view_command)
 
 
 
@@ -1558,17 +1681,12 @@ class SQLDataFrameWrapper:
         self.logger.info('Commited thread pool, it finished')
 
         self._model_extra_fields_table_create()
-        core_columns = [c for c in self.core_column_names if column_exists(self.connection, self.table_name, c)]
-        core_columns_select =",".join([f"a.{c}" for c in core_columns if c != "id"])
+        self.pivovted_views_update()
 
-        view_command = f"""create or replace view {self.table_name}_view as select {core_columns_select}, b.* from {self.table_name}_partial_view as a join {self.extra_fields_table_name} as b
-            on b.id = a.id
-            """
-
-        self._execute_command_dbapi(view_command)
         self.thread_executor = ThreadPoolExecutor(NUM_THREADS)
         conn = self.connection.raw_connection()
         self._partition_and_index_table(self.table_name, self.simple_columns)
+        self._partition_and_index_table(self.extra_fields_table_name, self.simple_columns)
 
     def __setitem__(self, key, value):
 
@@ -1597,7 +1715,7 @@ class SQLDataFrameWrapper:
                 SELECT column_name 
                 FROM information_schema.columns 
                 WHERE table_schema = 'public' 
-                AND table_name = '{self.table_name}'
+                AND table_name = '{self.table_name_for_select}'
             """)
             existing_column_names =  [row[0] for row in cursor.fetchall()]
 
@@ -1697,8 +1815,8 @@ class SQLDataFrameWrapper:
     def _inner_query(self, sql_query, fetch_complex = True):
 
         start = time.time()
-        info = caller_info()
-        self.logger.info(f'Caller is: {info}')
+        #info = caller_info()
+        #self.logger.info(f'Caller is: {info}')
         # Fetch the simple data portion from SQLite
         conn = self.connection
 
@@ -1762,7 +1880,6 @@ class SQLDataFrameWrapper:
         view_name = f"{self.table_name}_view"
         if self.has_extra_columns_view is None:
             result = self.__check_view_exists(self.connection, view_name)
-            print(f'RESULT!!: {result}')
             self.has_extra_columns_view = result
 
         return self.has_extra_columns_view
@@ -1770,10 +1887,7 @@ class SQLDataFrameWrapper:
     def query(self, query_str, start = None, stop = None, from_clause = "*", extra = "", with_complex = True):
         time_start = time.time()
         query_str = pandas_query_to_sqlite(query_str)
-        table_name_for_select = self.table_name
-        view_name = f"{self.table_name}_view"
-        if self.has_view:
-            table_name_for_select = view_name
+        table_name_for_select = self.table_name_for_select
 
         if query_str:
             query_str = f"WHERE {query_str}"
@@ -1781,7 +1895,7 @@ class SQLDataFrameWrapper:
             full_query = f"SELECT {from_clause} FROM  {table_name_for_select} {query_str}  {extra} LIMIT {stop} OFFSET {start}"
             result = self._inner_query(full_query, with_complex)
         else:
-            full_query = f"SELECT {from_clause} FROM {table_name_for_select} {query_str} {extra} asc"
+            full_query = f"SELECT {from_clause} FROM {table_name_for_select} {query_str} {extra}"
             result = self._inner_query(full_query, with_complex)
 
         end = time.time()
@@ -1853,6 +1967,7 @@ class SQLDataFrameWrapper:
 
         conn = self.connection
 
+        table_name_for_select = self.table_name_for_select
         simple_df = pd.read_sql(f"SELECT {selected_columns} FROM {self.table_name} WHERE {row_selection_query}", conn)
 
         simple_df = self._restore_types(simple_df)
