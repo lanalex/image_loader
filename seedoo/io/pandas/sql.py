@@ -797,7 +797,7 @@ class SQLDataFrameWrapper:
 
         # Create a temporary table
         temp_table_name = f"temp_{self.table_name}_{str(uuid.uuid4()).replace('-', '_')}"
-        temp_table_name = temp_table_name[0:60]
+        temp_table_name = temp_table_name[0:50]
 
         with self.connection.connect() as connection:
             connection.autocommit = True
@@ -981,7 +981,6 @@ class SQLDataFrameWrapper:
                 for c in chunk_df.columns.values:
                     vals = chunk_df[c].values
                     if len(vals.shape) > 1 and vals.shape[1] > 1:
-                        print(f'BAD DOUBLE COLUMN: {c}, DUPS: {vals.shape}')
                         vals = vals[:, 0]
                         del chunk_df[c]
                         chunk_df[c] = vals
@@ -1644,7 +1643,6 @@ class SQLDataFrameWrapper:
 
             """
 
-        print(more_view)
         self._execute_command_dbapi(more_view)
 
         final_view = f"""
