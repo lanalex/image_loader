@@ -548,7 +548,7 @@ class Region:
         sorted_df = df.sort_values(by=score_column, ascending=False)
         scores = sorted_df[score_column].values
         original_columns = df.columns.values.tolist()
-        grouped_df = Region.group_regions_df(sorted_df, "bbox", cluster_column_name="region_group",
+        grouped_df = Region.group_regions_df(sorted_df, bbox_column, cluster_column_name="region_group",
                                              max_relative_distance=max_relative_distance, score_column_name=score_column)
 
         original_columns.append("region_group")
@@ -637,6 +637,13 @@ class Region:
         df[cluster_column_name] = labels
 
         return df
+
+    @property
+    def center(self):
+        # Calculate the center of the bounding rectangle
+        center_x = self.column + self.width // 2
+        center_y = self.row + self.height // 2
+        return (center_x, center_y)
 
     @staticmethod
     def assign_single_object_id(df: pd.DataFrame) -> pd.DataFrame:
