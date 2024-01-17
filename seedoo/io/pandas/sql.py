@@ -299,7 +299,7 @@ def custom_to_sql(
 #pd.DataFrame.read_sql = custom_read_sql
 #pd.read_sql = custom_read_sql
 
-def pandas_query_to_sqlite(query_str):
+def pandas_query_to_db_query(query_str):
     # Access calling frame's local and global variables
     frame = inspect.stack()[1]
     calling_locals = frame[0].f_locals
@@ -797,7 +797,7 @@ class SQLDataFrameWrapper:
 
         # Create a temporary table
         temp_table_name = f"temp_{self.table_name}_{str(uuid.uuid4()).replace('-', '_')}"
-        temp_table_name = temp_table_name[0:50]
+        temp_table_name = temp_table_name[0:60]
 
         with self.connection.connect() as connection:
             connection.autocommit = True
@@ -1077,6 +1077,7 @@ class SQLDataFrameWrapper:
 
         if (table_name, partition_start, partition_end) not in self.partitions:
             partition_name = f"{table_name}_{uuid_safe()}"
+            partition_name = partition_name[0:60]
             statement = f"""CREATE TABLE {partition_name} PARTITION OF {table_name} FOR VALUES FROM
                 ({partition_start}) TO ({partition_end})"""
             self.partitions.add((table_name, partition_start, partition_end))
@@ -1412,25 +1413,24 @@ class SQLDataFrameWrapper:
             future = self.thread_executor.submit(self.fetch_raw_chunk, chunk_id)
             futures.append(future)
 
-        with tqdm.tqdm(total = len(futures), desc='Fetching complex columns') as pbar:
-            for future in as_completed(futures):
-                # If current row's chunk isn't cached, load and update cache
-                cached_chunk = future.result()
+        for future in as_completed(futures):
+            # If current row's chunk isn't cached, load and update cache
+            cached_chunk = future.result()
 
-                if cached_chunk is None:
-                    continue
+            if cached_chunk is None:
+                continue
 
-                # Use cached_chunk to extract the necessary rows
-                existing_complex_columns = set(cached_chunk.columns.values)
-                missing = set(self.complex_columns) - existing_complex_columns
-                if len(missing) > 0:
-                    self.logger.warning(f'Cached chunk {self.chunk_files[chunk_id]} has missing columns: {list(missing)}')
-                    for m in missing:
-                        cached_chunk[m] = ''
+            # Use cached_chunk to extract the necessary rows
+            existing_complex_columns = set(cached_chunk.columns.values)
+            missing = set(self.complex_columns) - existing_complex_columns
+            if len(missing) > 0:
+                self.logger.warning(f'Cached chunk {self.chunk_files[chunk_id]} has missing columns: {list(missing)}')
+                for m in missing:
+                    cached_chunk[m] = ''
 
-                cached_chunk = cached_chunk[self.complex_columns]
-                required_rows.append(cached_chunk)
-                pbar.update(1)
+            cached_chunk = cached_chunk[self.complex_columns]
+            required_rows.append(cached_chunk)
+
         self.logger.debug(f'Chunk pkl fetch duration: {(time.time() - s) * 1000} ms')
         if len(required_rows) > 0:
             matching_cols = list(set(self.simple_columns) & set(simple_df.columns.values))
@@ -1884,7 +1884,7 @@ class SQLDataFrameWrapper:
 
     def query(self, query_str, start = None, stop = None, from_clause = "*", extra = "", with_complex = True):
         time_start = time.time()
-        query_str = pandas_query_to_sqlite(query_str)
+        query_str = pandas_query_to_db_query(query_str)
         table_name_for_select = self.table_name_for_select
 
         if query_str:
