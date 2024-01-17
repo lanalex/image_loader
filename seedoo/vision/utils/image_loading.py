@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import tempfile
 import boto3
 import os
+import struct
 import urllib
 import logging
 import cv2
@@ -190,6 +191,36 @@ class ImageLoader:
         self.save_to_temp(image)
         return image
 
+    # Sub-function for JPEG dimensions
+    def _jpg_dimension(self, filepath):
+        with open(self.path, 'rb') as img_file:
+            img_file.read(2)  # SOI marker
+            b = img_file.read(1)
+            while b and ord(b) != 0xC0:
+                b = img_file.read(1)
+            img_file.read(3)  # Skip 3 bytes
+            h, w = struct.unpack('>HH', img_file.read(4))
+            return w, h
+
+    # Sub-function for PNG dimensions
+    def _png_dimensions(self,filepath):
+        with open(filepath, 'rb') as img_file:
+            img_file.read(16)  # First 16 bytes
+            w, h = struct.unpack('>LL', img_file.read(8))
+            return w, h
+
+    @property
+    def size(self):
+        """
+        :return: The size of the image. Returns a (width, height) tuple
+        """
+        _, file_extension = os.path.splitext(self.path)
+        if file_extension.lower() in ['.jpg', '.jpeg', ".JPG", ".JPEG"]:
+            return self._jpg_dimension(self.path)
+        elif file_extension.lower() in ['.png', ".PNG"]:
+            return self._png_dimensions(self.path)
+        else:
+            raise ValueError("Unsupported file format")
 
 
     @classmethod
