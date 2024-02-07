@@ -86,7 +86,6 @@ def create_error_image_cv2(message = ''):
 
 def read_heic_as_bgr(heic_path):
     # Read the HEIC file using pyheif
-    print(heic_path)
     heif_file = pyheif.read(heic_path)
 
     # Convert to PIL Image
@@ -184,12 +183,51 @@ class ImageLoader:
             with urllib.request.urlopen(req, timeout=1.5) as f:
                 image = Image.open(f).convert("RGB")
         except:
-            print('ERROR')
+            logging.getLogger(__name__).exception('Error in download image from url')
             image = create_error_image_cv2()
 
         image = np.array(image)[...,[2,1,0]]
         self.save_to_temp(image)
         return image
+
+        # Sub-function for TIFF dimensions
+
+    def _tiff_dimensions(self, filepath):
+        with open(filepath, 'rb') as img_file:
+            # Read the first 4 bytes to determine byte order
+            byte_order = img_file.read(2)
+            if byte_order == b'MM':
+                fmt = '>'  # Big endian
+            elif byte_order == b'II':
+                fmt = '<'  # Little endian
+            else:
+                raise ValueError("Invalid TIFF file")
+
+            # Read the next two bytes (42 in the correct byte order)
+            two_bytes = struct.unpack(fmt + 'H', img_file.read(2))[0]
+            if two_bytes != 42:
+                raise ValueError("Invalid TIFF file")
+
+            # Read the offset of the first Image File Directory (IFD)
+            ifd_offset = struct.unpack(fmt + 'L', img_file.read(4))[0]
+
+            # Go to the IFD and read the number of directory entries
+            img_file.seek(ifd_offset)
+            num_dir_entries = struct.unpack(fmt + 'H', img_file.read(2))[0]
+
+            # Search for Width (256) and Height (257) tags
+            width, height = None, None
+            for _ in range(num_dir_entries):
+                tag, type, count, value = struct.unpack(fmt + 'HHL4s', img_file.read(12))
+                if tag == 256:  # Image width tag
+                    width = int.from_bytes(value[:type], byte_order)
+                elif tag == 257:  # Image height tag
+                    height = int.from_bytes(value[:type], byte_order)
+
+            if width is not None and height is not None:
+                return width, height
+            else:
+                raise ValueError("Width and Height not found in TIFF file")
 
     # Sub-function for JPEG dimensions
     def _jpg_dimension(self, filepath):
@@ -214,13 +252,19 @@ class ImageLoader:
         """
         :return: The size of the image. Returns a (width, height) tuple
         """
+        if not self.path:
+            img = self.image
+            return img.shape[1], img.shape[0]
+
         _, file_extension = os.path.splitext(self.path)
         if file_extension.lower() in ['.jpg', '.jpeg', ".JPG", ".JPEG"]:
             return self._jpg_dimension(self.path)
         elif file_extension.lower() in ['.png', ".PNG"]:
             return self._png_dimensions(self.path)
+        elif file_extension in ['.tiff', '.tif']:
+            return self._tiff_dimensions(self.path)
         else:
-            raise ValueError("Unsupported file format")
+            raise ValueError(f"Unsupported file format: {file_extension}")
 
 
     @classmethod
