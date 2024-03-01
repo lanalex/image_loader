@@ -1586,7 +1586,6 @@ class SQLDataFrameWrapper:
                 chunking_index  bigint,
                 prob            double precision default '-1.0'::numeric,
                 prob_vat        double precision default '-1.0'::numeric,
-                prob_delta_vat  double precision default '-1.0'::numeric,
                 vat_changed boolean          default false,
                 prob_delta      double precision default '-1.0'::numeric,
                 prob_vat_delta  double precision default '-1.0'::numeric,
