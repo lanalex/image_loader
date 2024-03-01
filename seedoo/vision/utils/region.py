@@ -9,7 +9,9 @@ import pandas as pd
 import numpy as np
 import torch.nn.functional as F
 import scipy
+import copy
 from shapely import affinity
+import math
 from scipy.sparse.csgraph import connected_components
 import scipy.spatial
 import numpy as np
@@ -579,10 +581,20 @@ class Region:
         final = grouped_df[grouped_df['region_group'] == best_group]
         return combined_bbox, final[original_columns]
 
+    def diagonal(self):
+        # Select two vertices (diagonal of a rectangle in this case)
+        vertex1 = self.polygon.exterior.coords[0]
+        vertex2 = self.polygon.exterior.coords[2]
+
+        # Calculate the diagonal length using the distance formula
+        diagonal_length = math.sqrt((vertex2[0] - vertex1[0]) ** 2 + (vertex2[1] - vertex1[1]) ** 2)
+        return diagonal_length
+
+
     @staticmethod
     def group_regions_df(df: pd.DataFrame, coordinate_columns=['xmin', 'ymin', 'xmax', 'ymax'],
                          cluster_column_name: str = 'cluster_id',
-                         max_relative_distance: float = 0.1, score_column_name = None, score_tolerance = 0.65) -> pd.DataFrame:
+                         max_relative_distance: float = 0.1, score_column_name = None, score_tolerance = 0.7) -> pd.DataFrame:
 
         if len(df) == 0:
             return df
@@ -638,6 +650,79 @@ class Region:
 
         return df
 
+    def flip_h(self, image_width):
+        """
+        Return a new Region instance that is a horizontal flip of the current instance within the given image width.
+
+        Args:
+            image_width (int): The width of the image in which the region is located.
+
+        Returns:
+            Region: New Region instance flipped horizontally.
+        """
+        # Create a deep copy of the current Region to keep original intact
+        flipped_region = copy.deepcopy(self)
+
+        # Recalculate the column (x-coordinate) for the flipped region
+        flipped_region.column = image_width - self.column - self.width
+
+        # Flip the polygon horizontally if it exists
+        if flipped_region.polygon:
+            flipped_region.polygon = affinity.scale(flipped_region.polygon, xfact=-1, yfact=1, origin=(image_width / 2, 0))
+
+        return flipped_region
+
+    def flip_v(self, image_height):
+        """
+        Return a new Region instance that is a vertical flip of the current instance within the given image height.
+
+        Args:
+            image_height (int): The height of the image in which the region is located.
+
+        Returns:
+            Region: New Region instance flipped vertically.
+        """
+        # Create a deep copy of the current Region to keep original intact
+        flipped_region = copy.deepcopy(self)
+
+        # Recalculate the row (y-coordinate) for the flipped region
+        flipped_region.row = image_height - self.row - self.height
+
+        # Flip the polygon vertically if it exists
+        if flipped_region.polygon:
+            flipped_region.polygon = affinity.scale(flipped_region.polygon, xfact=1, yfact=-1, origin=(0, image_height / 2))
+
+        return flipped_region
+
+    @staticmethod
+    def _angle(pointA, pointB):
+        #points = [pointA, pointB]
+        #points = sorted(points)
+        #pointA, pointB = points
+
+        x_diff = pointB[0] - pointA[0]
+        y_diff = pointB[1] - pointA[1]
+
+        angle = math.degrees(math.atan2(y_diff, x_diff))
+
+        # Adjusting the angle to be between 0 and 360 degrees
+        angle = angle % 360
+
+        return angle
+
+
+    def angle(self, other):
+        """
+        Calculate the angle between two points in an image.
+
+        :param pointA: tuple (x, y) of the first point
+        :param pointB: tuple (x, y) of the second point
+        :return: angle in degrees
+        """
+        pointA, pointB = self.center, other.center
+        return Region._angle(pointA, pointB)
+
+
     @property
     def center(self):
         # Calculate the center of the bounding rectangle
@@ -662,7 +747,7 @@ class Region:
     @staticmethod
     def draw(image, regions, labels: List[str] = [],
              colors: List[tuple] = [],
-             fonts: List[int] = [cv2.FONT_HERSHEY_SIMPLEX], thickness: int = 1, overlay_transparency = 0.0):
+             fonts: List[int] = [cv2.FONT_HERSHEY_SIMPLEX], thickness: int = 2, overlay_transparency = 0.0):
 
         """
 
@@ -684,7 +769,7 @@ class Region:
             labels = [""] * len(regions)
 
         if not colors:
-            colors = [(30, 255, 30)] * len(regions)
+            colors = [(255, 10, 10)] * len(regions)
 
         if len(fonts) == 1:
             fonts = fonts * len(regions)
@@ -741,8 +826,8 @@ class Region:
             for k,v in label.items():
                 if v:
                     final_label = f"{v}"
-                    label_width, label_height = cv2.getTextSize(final_label, font, 1.0, thickness)[0]
-                    image = cv2.putText(image, final_label, (current_region.column + current_region.width // 2 - label_width, current_region.row - 10 + offset + label_height), font, 0.75, color, thickness)
+                    label_width, label_height = cv2.getTextSize(final_label, font, 0.35, thickness)[0]
+                    image = cv2.putText(image, final_label, (current_region.column + current_region.width // 2 - label_width, current_region.row - 10 + offset + label_height), font, 0.5, color, thickness)
                     offset += label_height + 20
 
 
