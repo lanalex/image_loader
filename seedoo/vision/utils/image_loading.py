@@ -444,4 +444,4 @@ class ListOfImageLoaders:
 
     def __str__(self):
         df = self.to_df()
-        return df.to_html(escape=False).replace("\n", "")
+        return df.to_html(escape=False, index = False).replace("\n", "")
