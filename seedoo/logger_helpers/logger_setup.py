@@ -97,6 +97,17 @@ class WebsocketFilter(logging.Filter):
         if 'websockets.server' in record.module:
             return False
         return True
+
+class IgnoreSpecificModuleFilter(logging.Filter):
+    def __init__(self, module_to_ignore):
+        super().__init__()
+        self.module_to_ignore = module_to_ignore
+
+    def filter(self, record):
+        # Check if the log record's module name is from the module we want to ignore
+        return not record.name.startswith(self.module_to_ignore)
+
+
 class ExceptionFilter(logging.Filter):
     def filter(self, record):
         return record.exc_info is not None
@@ -115,7 +126,6 @@ def initialize_logger():
     logger = logging.getLogger()
     if logger.hasHandlers():
         return logger
-
 
     LOGS_DIR = os.path.expanduser("~/seedoo_logs")
     write_to_file = bool(os.environ.get("SEEDOO_WRITE_LOGS_TO_FILE", "True"))
@@ -138,6 +148,7 @@ def initialize_logger():
             add_stdout = False
     except ImportError:
         pass
+
     if add_stdout:
         stdout_handler = logging.StreamHandler(sys.stdout)
         stdout_handler.setFormatter(formatter)
@@ -180,6 +191,8 @@ def initialize_logger():
         exception_file_handler.setFormatter(formatter)
         exception_file_handler.addFilter(ExceptionFilter())
         logger.addHandler(exception_file_handler)
+
+    logging.getLogger('seedoo.io.pandas').setLevel(logging.WARNING)
 
     return logger
 
