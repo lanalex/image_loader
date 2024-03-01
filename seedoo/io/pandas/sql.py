@@ -323,7 +323,7 @@ def pandas_query_to_db_query(query_str):
             value = f'"{value}"' if isinstance(value, str) else str(value)
             query_str = query_str.replace(match, value)
 
-    query_str = re.sub(r'([a-zA-Z_]+[A-Z_]*[a-zA-Z_]*)\s*(=|>|<|LIKE|IN)', r'"\1" \2', query_str)
+    query_str = re.sub(r'([a-zA-Z_][a-zA-Z_\.]*[a-zA-Z_])\s*(=|>|<|LIKE|IN)', r'"\1" \2', query_str)
     return query_str
 
 class SQLDataFrameAttrWrapper:
