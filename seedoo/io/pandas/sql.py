@@ -1541,6 +1541,7 @@ class SQLDataFrameWrapper:
                     index_name     varchar   default 'Undefined'::character varying,
                     chunking_index integer   default '-1'::integer,
                     file_name      varchar,
+                    bbox varchar,
                     timestamp      timestamp default CURRENT_TIMESTAMP,
                     source         varchar   default 'human'::character varying,
                     model          varchar   default 'basic'::character varying
