@@ -456,9 +456,9 @@ class Region:
 
     @staticmethod
     def from_connected_components(mask: np.ndarray, image: np.ndarray = None): #-> List[Region]:
-        labels = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        labels = skimage.measure.label(mask)
         results = []
-        for region_props in skimage.measure.regionprops(labels[1], intensity_image=image):
+        for region_props in skimage.measure.regionprops(labels, intensity_image=image):
             results.append(Region(region_props=region_props))
 
         return results
