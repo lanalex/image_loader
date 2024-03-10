@@ -1515,7 +1515,11 @@ class SQLDataFrameWrapper:
                 alter sequence models_id_seq owner to seedoo;
                 
                 alter sequence models_id_seq owned by models.id;
-                            
+                
+                -- auto-generated definition
+                create sequence if not exists label_definitions_id_seq;
+                alter sequence label_definitions_id_seq owner to seedoo;
+                 
                 -- auto-generated definition
                 create table  if not exists  label_definitions
                 (
@@ -1529,9 +1533,7 @@ class SQLDataFrameWrapper:
                 alter table label_definitions
                     owner to seedoo;
                 
-                -- auto-generated definition
-                create sequence if not exists label_definitions_id_seq;
-                alter sequence label_definitions_id_seq owner to seedoo;
+
                 
                 -- auto-generated definition
                 create table if not exists  labels
