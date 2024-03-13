@@ -533,7 +533,9 @@ class SQLDataFrameWrapper:
         thread_id = 0 % 1
 
         if thread_id not in self._connection:
-            connection_string = f'postgresql+psycopg2://seedoo:kDASAEspJEdHp7@localhost/seedoo'
+            host = os.environ.get('SEEDOO_DB_IP', 'localhost')
+            port = os.environ.get('SEEDOO_DB_PORT', '5432')
+            connection_string = f'postgresql+psycopg2://seedoo:kDASAEspJEdHp7@{host}:{port}/seedoo'
             conn = create_engine(connection_string, isolation_level="AUTOCOMMIT",
             pool_size=20,  # Maximum number of permanent connections to keep
             max_overflow=15,  # Maximum number of overflow connections
