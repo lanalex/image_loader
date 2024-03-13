@@ -1,0 +1,19 @@
+# Default ignored files
+/shelf/
+/workspace.xml
+# Editor-based HTTP Client requests
+/httpRequests/
+# Datasource local storage ignored files
+/dataSources/
+/dataSources.local.xml
+/copilot/chatSessions/00000000000.xd
+/dataSources.xml
+/deployment.xml
+/image_loader.iml
+/misc.xml
+/modules.xml
+/inspectionProfiles/profiles_settings.xml
+/inspectionProfiles/Project_Default.xml
+/vcs.xml
+/copilot/chatSessions/blobs/version
+/copilot/chatSessions/xd.lck
