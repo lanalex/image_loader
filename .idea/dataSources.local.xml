@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="dataSourceStorageLocal" created-in="PY-233.14475.56">
+    <data-source name="database.db" uuid="e7884842-f192-4394-a2b3-b53d45b8eb61">
+      <database-info product="" version="" jdbc-version="" driver-name="" driver-version="" dbms="SQLITE" />
+      <schema-mapping />
+    </data-source>
+    <data-source name="seedoo@localhost_azure" uuid="f19af7fa-be43-4c4b-a25a-88598cc7f96d">
+      <database-info product="" version="" jdbc-version="" driver-name="" driver-version="" dbms="POSTGRES" />
+      <schema-mapping />
+    </data-source>
+    <data-source name="seedoo@localhost_nebius" uuid="fd183cd0-54b2-4d3b-b933-97ba0d0167e0">
+      <database-info product="" version="" jdbc-version="" driver-name="" driver-version="" dbms="POSTGRES" />
+      <schema-mapping />
+    </data-source>
+    <data-source name="seedoo@azure_matan" uuid="0143afa4-049c-4c71-bf61-0958b08b7603">
+      <database-info product="" version="" jdbc-version="" driver-name="" driver-version="" dbms="POSTGRES" />
+      <schema-mapping />
+    </data-source>
+    <data-source name="seedoo@localhost_oddity" uuid="bac0bf52-9b25-4c0e-b52d-2578fd39f443">
+      <database-info product="" version="" jdbc-version="" driver-name="" driver-version="" dbms="POSTGRES" />
+      <schema-mapping />
+    </data-source>
+    <data-source name="azure_manager" uuid="b5876d02-1bbb-48d3-b0a5-918f839cf1c6">
+      <database-info product="" version="" jdbc-version="" driver-name="" driver-version="" dbms="POSTGRES" />
+      <schema-mapping />
+    </data-source>
+    <data-source name="postgres@azure_ui_vm" uuid="a0754dce-14f1-477e-a7c2-b27df6f354f0">
+      <database-info product="" version="" jdbc-version="" driver-name="" driver-version="" dbms="POSTGRES" />
+      <schema-mapping />
+    </data-source>
+  </component>
+</project>

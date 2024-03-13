@@ -1,0 +1,14 @@
+Index: .idea/.gitignore
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+># Default ignored files\r\n/shelf/\r\n/workspace.xml\r\n# Editor-based HTTP Client requests\r\n/httpRequests/\r\n# Datasource local storage ignored files\r\n/dataSources/\r\n/dataSources.local.xml\r\n
+===================================================================
+diff --git a/.idea/.gitignore b/.idea/.gitignore
+--- a/.idea/.gitignore	
++++ b/.idea/.gitignore	
+@@ -6,3 +6,5 @@
+ # Datasource local storage ignored files
+ /dataSources/
+ /dataSources.local.xml
++# GitHub Copilot persisted chat sessions
++/copilot/chatSessions
