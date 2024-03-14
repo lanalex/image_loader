@@ -23,10 +23,10 @@
           </mappings>
         </serverdata>
       </paths>
-      <paths name="seedoo.Azure.test-preprocessing-vm-004">
+      <paths name="seedoo.Azure.test-preprocessing-vm-006">
         <serverdata>
           <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/home/seedoo/code/image_loader" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
