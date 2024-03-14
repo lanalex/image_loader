@@ -2,7 +2,11 @@
 from shapely.geometry import box as shapely_box
 import shapely.geometry
 import colorsys
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, Point
+from alphashape import alphashape
+
+from scipy.spatial import ConvexHull
+
 from typing import List, Union
 import torchvision.transforms.functional as Fv
 import pandas as pd
@@ -165,7 +169,7 @@ class Region:
 
                 # Check if the coordinates span more than a point in any direction
                 if len(coords) >= 3:
-                    self.polygon = MultiPoint(coords).convex_hull
+                    self.polygon = alphashape(region_props.coords, 0.5)
                 else:
                     self.polygon = self.box
 
@@ -672,6 +676,44 @@ class Region:
 
         return flipped_region
 
+    def to_regions(self, patch_size):
+        """
+        This function takes the polygon that outlines the inner shape of this rectangle. and returns a list of bboxes
+        that cover that polygon as tightly as possible. Each region will represent a bbox of size patch_size x patch_size
+        """
+        # Get the bounds of the polygon
+        polygon = self.polygon
+        min_x, min_y, max_x, max_y = polygon.bounds
+
+        x_points = np.arange(min_x, max_x, patch_size)
+        y_points = np.arange(min_y, max_y, patch_size)
+        x_grid, y_grid = np.meshgrid(x_points, y_points)
+        grid_points = np.column_stack((x_grid.ravel(), y_grid.ravel()))
+
+        # Generate points along the boundary of the polygon
+        boundary_points = np.array(polygon.exterior.coords)
+        boundary_points = np.unique(np.round(boundary_points, decimals=8), axis=0)  # Remove duplicate points
+        boundary_points = np.floor(boundary_points / patch_size) * patch_size  # Round to nearest patch_size
+
+        # Combine grid points with boundary points
+        all_points = np.vstack([grid_points, boundary_points])
+
+        # Calculate bounding boxes for all points
+        bboxes = []
+        for point in all_points:
+            point_a = Point(*point)
+            point_b = Point(*(point + patch_size))
+
+            if point_a.intersection(polygon) or point_b.intersection(polygon):
+                x = point[0]
+                y = point[1]
+                width = patch_size
+                height = patch_size
+                bboxes.append((x, y, width, height))
+
+        regions = [Region.from_xywh(*bbox).instance for bbox in bboxes]
+        return regions
+
     def flip_v(self, image_height):
         """
         Return a new Region instance that is a vertical flip of the current instance within the given image height.
@@ -896,7 +938,16 @@ if __name__ == "__main__":
 
     r = Region(new_bbox=points)
     b = r.box.bounds
-    im = cv2.imread(os.path.expanduser("~/Downloads/region_test_image.png"))
+    im = cv2.imread(os.path.expanduser("~/Downloads/test.jpg"))
+    m = im.max(axis = 2) > 250
+    m = m.astype('float').transpose(1,0)
+    regions = Region.from_connected_components(m)
+    from seedoo.vision.utils.image_loading import ImageLoader
+
+    im = ImageLoader(path = os.path.expanduser("~/Downloads/test.jpg"))
+    sub_regions = regions[0].to_regions(14)
+    i = im.draw_regions(sub_regions)
+    Image.fromarray(i.image).save(os.path.expanduser("~/Downloads/output.jpg"))
     im2 = Region.draw(im, [r])
     cv2.imwrite("./output.png", im2)
     print(b)
