@@ -13,3 +13,5 @@
 /vcs.xml
 /copilot/chatSessions/blobs/version
 /copilot/chatSessions/xd.lck
+# GitHub Copilot persisted chat sessions
+/copilot/chatSessions
