@@ -30,20 +30,6 @@
           </mappings>
         </serverdata>
       </paths>
-      <paths name="seedoo.Azure.test-preprocessing-vm-007">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/home/seedoo/code/image_loader" local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="seedoo.Azure.test-preprocessing-vm-008">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/home/seedoo/code/image_loader" local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
       <paths name="seedoo.Azure.vm.gpuv2">
         <serverdata>
           <mappings>
@@ -52,6 +38,13 @@
         </serverdata>
       </paths>
       <paths name="seedoo.Nebius.vm">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/seedoo/code/image_loader" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="seedoo.test-indexing-vm-003">
         <serverdata>
           <mappings>
             <mapping deploy="/home/seedoo/code/image_loader" local="$PROJECT_DIR$" web="/" />
