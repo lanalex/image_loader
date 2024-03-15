@@ -13,5 +13,4 @@ dynamic = ["dependencies"]
 dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.packages.find]
-where = ["seedoo"]
 include = ["seedoo*"]
