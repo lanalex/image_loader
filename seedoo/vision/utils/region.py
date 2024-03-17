@@ -2,7 +2,7 @@
 from shapely.geometry import box as shapely_box
 import shapely.geometry
 import colorsys
-from shapely.geometry import Polygon, Point
+from shapely.geometry import Polygon, Point, LineString
 from alphashape import alphashape
 
 from scipy.spatial import ConvexHull
@@ -138,7 +138,7 @@ class Region:
             self.box = new_bbox
             self.polygon = new_bbox
         elif polygon is not None:
-            if not isinstance(polygon, shapely.geometry.Polygon):
+            if not isinstance(polygon, (shapely.geometry.Polygon, LineString)):
                 polygon = string_convert_to_polygon(polygon, rotation)
 
             self.polygon = polygon
@@ -348,8 +348,16 @@ class Region:
         return RegionStub(polygon=polygon, metadata = metadata)
 
     @staticmethod
+    def from_coords(coords_list, metadata = {}):
+        polygon = alphashape(coords_list, 0.05)
+        if not polygon or isinstance(Polygon, LineString):
+            polygon = MultiPoint(coords_list).convex_hull
+
+        return Region.from_polygon(polygon=polygon, metadata=metadata)
+
+    @staticmethod
     def from_polygon(polygon, metadata = {}):
-        return RegionStub(polygon=polygon, metadata=metadata)
+        return Region(polygon=polygon, metadata=metadata)
 
     @property
     def region_props(self) -> RegionProperties:
@@ -545,7 +553,7 @@ class Region:
         return selected_rows
 
     def to_xywh(self):
-        return (self.column, self.row, self.width, self.height)
+        return (int(self.column), int(self.row), int(self.width), int(self.height))
 
     @staticmethod
     def combine_highest_scoring_bboxes(df: pd.DataFrame, bbox_column: str, score_column: str,
@@ -690,8 +698,15 @@ class Region:
         x_grid, y_grid = np.meshgrid(x_points, y_points)
         grid_points = np.column_stack((x_grid.ravel(), y_grid.ravel()))
 
-        # Generate points along the boundary of the polygon
-        boundary_points = np.array(polygon.exterior.coords)
+
+        # Generate points along the boundary of the polygon or line
+        if isinstance(polygon, Polygon):
+            boundary_points = np.array(polygon.exterior.coords)
+        elif isinstance(polygon, LineString):
+            boundary_points = np.array(polygon.coords)
+        else:
+            raise ValueError("Unsupported geometry type: {}".format(type(polygon)))
+
         boundary_points = np.unique(np.round(boundary_points, decimals=8), axis=0)  # Remove duplicate points
         boundary_points = np.floor(boundary_points / patch_size) * patch_size  # Round to nearest patch_size
 
@@ -863,7 +878,13 @@ class Region:
             offset = 0
 
             polygon = current_region.polygon
-            exterior = [np.array(polygon.exterior.coords).round().astype(np.int32)]
+
+            if isinstance(polygon, Polygon):
+                coords = np.array(polygon.exterior.coords)
+            elif isinstance(polygon, LineString):
+                coords = np.array(polygon.coords)
+
+            exterior = [coords.round().astype(np.int32)]
 
             for k,v in label.items():
                 if v:
@@ -935,14 +956,23 @@ if __name__ == "__main__":
     points = '69.09780643249724,720.0,71.66209386281844,697.7761732852014,65.42382671480482,682.1805054151664,63.3444043321324,666.5848375451296,76.86064981949676,656.187725631773,93.49602888086883,654.1083032491006,108.05198555957031,645.7906137184145,110.13140794224091,630.1949458483778,118.44909747292695,615.6389891696781,134.04476534296373,612.5198555956704,153.0,610.2000000000007,160.3000000000011,621.2000000000007,153.7992779783417,648.9097472924223,153.7992779783417,665.5451263537943,156.91841155234943,682.1805054151664,165.23610108303546,696.7364620938661,174.5935018050568,710.2527075812304,181.3416273257426,720.0'
     points = points.split(",")
     points = [float(i) for i in points]
+    from seedoo.vision.utils.image_loading import ImageLoader
 
     r = Region(new_bbox=points)
     b = r.box.bounds
     im = cv2.imread(os.path.expanduser("~/Downloads/test.jpg"))
     m = im.max(axis = 2) > 250
     m = m.astype('float').transpose(1,0)
+    coords= [(119, 91), (119, 91 + 14), (119, 91 + 28)]
+    #coords = [tuple(list(i)[::-1]) for i in coords]
+    coords = np.unique(np.round(coords, decimals=8), axis=0)  # Remove duplicate points
+    region = Region.from_coords(coords)
+    new_image = np.zeros((300, 300, 3), dtype = np.uint8)
+    img = ImageLoader(image = new_image).draw_regions([region])
+    Image.fromarray(img.image).save(os.path.expanduser("~/Downloads/output2.jpg"))
+
     regions = Region.from_connected_components(m)
-    from seedoo.vision.utils.image_loading import ImageLoader
+
 
     im = ImageLoader(path = os.path.expanduser("~/Downloads/test.jpg"))
     sub_regions = regions[0].to_regions(14)
