@@ -1554,24 +1554,33 @@ class SQLDataFrameWrapper:
                 alter table labels
                     owner to seedoo;
                     
-                create or replace view latest_labels_view as
-                WITH LatestLabels AS (
-                    SELECT
-                        chunking_index,
-                        taxonomy,
-                        timestamp,
-                        model,
-                        bbox
-                        index_name,
-                        file_name,
-                        source,
-                        value,
-                        ROW_NUMBER() OVER (PARTITION BY bbox, file_name, taxonomy, index_name, source ORDER BY timestamp DESC) as rn
-                    FROM labels
-                )
-                SELECT chunking_index, taxonomy, value, source, timestamp, index_name, model, bbox
-                FROM LatestLabels
-                WHERE rn = 1;
+            CREATE OR REPLACE VIEW latest_labels_view AS
+            WITH LatestTimestamp AS (
+                SELECT
+                    file_name,
+                    taxonomy,
+                    index_name,
+                    source,
+                    MAX(timestamp) as max_timestamp
+                FROM labels
+                GROUP BY file_name, taxonomy, index_name, source
+            )
+            SELECT
+                l.chunking_index,
+                l.taxonomy,
+                l.value,
+                l.source,
+                l.timestamp,
+                l.index_name,
+                l.model,
+                l.bbox
+            FROM labels l
+            INNER JOIN LatestTimestamp lt ON
+                l.file_name = lt.file_name AND
+                l.taxonomy = lt.taxonomy AND
+                l.index_name = lt.index_name AND
+                l.source = lt.source AND
+                l.timestamp = lt.max_timestamp;
         """
         self._execute_command_dbapi(command)
 
