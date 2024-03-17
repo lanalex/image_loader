@@ -1545,7 +1545,7 @@ class SQLDataFrameWrapper:
                     index_name     varchar   default 'Undefined'::character varying,
                     chunking_index integer   default '-1'::integer,
                     file_name      varchar,
-                    bbox varchar,
+                    bbox varchar default '[[0,0,0,0]]'::character varying,
                     timestamp      timestamp default CURRENT_TIMESTAMP,
                     source         varchar   default 'human'::character varying,
                     model          varchar   default 'basic'::character varying
@@ -1561,14 +1561,15 @@ class SQLDataFrameWrapper:
                         taxonomy,
                         timestamp,
                         model,
+                        bbox
                         index_name,
                         file_name,
                         source,
                         value,
-                        ROW_NUMBER() OVER (PARTITION BY chunking_index, taxonomy, index_name, source ORDER BY timestamp DESC) as rn
+                        ROW_NUMBER() OVER (PARTITION BY bbox, file_name, taxonomy, index_name, source ORDER BY timestamp DESC) as rn
                     FROM labels
                 )
-                SELECT chunking_index, taxonomy, value, source, timestamp, index_name, model
+                SELECT chunking_index, taxonomy, value, source, timestamp, index_name, model, bbox
                 FROM LatestLabels
                 WHERE rn = 1;
         """
@@ -2140,3 +2141,5 @@ if __name__ == "__main__":
     e = time.time()
 
     print(f'TEST DURAITON: {(e- s) * 1000} ms')
+
+
