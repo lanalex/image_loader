@@ -535,12 +535,12 @@ class SQLDataFrameWrapper:
         if thread_id not in self._connection:
             host = os.environ.get('SEEDOO_DB_IP', 'localhost')
             port = os.environ.get('SEEDOO_DB_PORT', '5432')
-            connection_string = f'postgresql+psycopg2://seedoo:kDASAEspJEdHp7@{host}:{port}/seedoo'
+            connection_string = f'postgresql+psycopg2://seedoo:kDASAEspJEdHp7@{host}:{port}/seedoo?options=-c%20statement_timeout=144000000'
             conn = create_engine(connection_string, isolation_level="AUTOCOMMIT",
             pool_size=20,  # Maximum number of permanent connections to keep
             max_overflow=15,  # Maximum number of overflow connections
             pool_timeout=30,  # Timeout for acquiring a connection from the pool
-            pool_recycle=1800  # Time in seconds a connection can be reused
+            pool_recycle=3600  # Time in seconds a connection can be reused
             )
             self._connection[thread_id] = conn
 
@@ -813,6 +813,9 @@ class SQLDataFrameWrapper:
                 cursor.execute(f"ALTER TABLE {self.table_name} ADD CONSTRAINT  chunking_index_unique_{self.table_name} UNIQUE (chunking_index)")
             except psycopg2.errors.DuplicateTable:
                 pass
+            except psycopg2.errors.UniqueViolation:
+                pass
+
 
 
             # Reflect the current table structure from the database
@@ -884,14 +887,21 @@ class SQLDataFrameWrapper:
         Parameters:
         - df: DataFrame with new data.
         """
+        self.logger.info('Running upsert')
         self.upsert(df)
+        self.logger.info('Finished upsert')
+
+        self.logger.info('Identifying types')
         provided_simple_cols, provided_complex_cols, special_types = self.identify_column_types(df)
+        self.logger.info('Done identifying types')
         remaining_complex_columns = set(provided_complex_cols) - set(["chunking_index", "chunk_id"])
 
         if remaining_complex_columns:
+            self.logger.info("Handling complex columns")
             self.logger.info('Handling complex columns')
             df = df.drop_duplicates(subset = ['chunking_index'])
             self.update_chunked_dataframes(df[provided_complex_cols])
+            self.logger.info("Done handling complex columns")
 
 
     def _update_complex_columns(self):
@@ -1554,6 +1564,7 @@ class SQLDataFrameWrapper:
                 alter table labels
                     owner to seedoo;
                     
+            
             CREATE OR REPLACE VIEW latest_labels_view AS
             WITH LatestTimestamp AS (
                 SELECT
@@ -1561,9 +1572,10 @@ class SQLDataFrameWrapper:
                     taxonomy,
                     index_name,
                     source,
+                    model,
                     MAX(timestamp) as max_timestamp
                 FROM labels
-                GROUP BY file_name, taxonomy, index_name, source
+                GROUP BY file_name, taxonomy, index_name, source,model
             )
             SELECT
                 l.chunking_index,
@@ -1573,7 +1585,8 @@ class SQLDataFrameWrapper:
                 l.timestamp,
                 l.index_name,
                 l.model,
-                l.bbox
+                l.bbox,
+                l.file_name
             FROM labels l
             INNER JOIN LatestTimestamp lt ON
                 l.file_name = lt.file_name AND
