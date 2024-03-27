@@ -1,8 +1,12 @@
 #from __future__ import annotations
+import logging
+
 from shapely.geometry import box as shapely_box
 import shapely.geometry
 import colorsys
-from shapely.geometry import Polygon, Point, LineString
+from shapely.geometry import Polygon, Point, LineString, MultiPolygon
+from shapely.ops import unary_union
+
 from alphashape import alphashape
 
 from scipy.spatial import ConvexHull
@@ -127,6 +131,7 @@ class Region:
         self._children = []
         self._polygon = None
         self.simplified = False
+        logger = logging.getLogger(__name__)
         self._box = None
 
         if metadata is None:
@@ -138,7 +143,7 @@ class Region:
             self.box = new_bbox
             self.polygon = new_bbox
         elif polygon is not None:
-            if not isinstance(polygon, (shapely.geometry.Polygon, LineString)):
+            if not isinstance(polygon, (shapely.geometry.Polygon, LineString, MultiPolygon)):
                 polygon = string_convert_to_polygon(polygon, rotation)
 
             self.polygon = polygon
@@ -168,8 +173,30 @@ class Region:
                 coords = region_props.coords
 
                 # Check if the coordinates span more than a point in any direction
-                if len(coords) >= 3:
-                    self.polygon = alphashape(region_props.coords, 0.5)
+                coords_array = np.array(coords)
+
+                if len(np.unique(coords_array[:, 0])) >= 3 and len(np.unique(coords_array[:, 1])) >= 3:
+                    coords_array = coords_array[:, [1,0]]
+
+                    try:
+                        self.polygon = alphashape(coords_array.tolist(), 0.0001)
+                    except scipy.spatial._qhull.QhullError:
+                        logger.warning('QhullError in alphashape, reverting to convex hull')
+                        self.polygon = MultiPoint(coords_array[:, [1, 0]]).convex_hull
+
+
+                    if isinstance(self.polygon, MultiPolygon):
+                        self.polygon = max(self.polygon.geoms, key=lambda p: p.area)
+
+                    if not self.polygon:
+                        logger.warning(f'BAD POLYGON!!!, polygon was: {self.polygon} coords was: {coords}, using multi point')
+                        self.polygon = MultiPoint(coords_array[:, [1, 0]]).convex_hull
+                        if not self.polygon:
+                            raise ValueError(f'BAD POLYGON even after using only MultiPoint, coords was: {coords}, ')
+
+
+
+
                 else:
                     self.polygon = self.box
 
@@ -256,6 +283,9 @@ class Region:
             # Calculate intersection and union areas
         intersection_area = polygon1.intersection(polygon2).area
         union_area = polygon1.area + polygon2.area - intersection_area
+
+        if union_area == 0:
+            return 0.0
 
         # Calculate IoU
         iou = intersection_area / union_area
@@ -348,10 +378,49 @@ class Region:
         return RegionStub(polygon=polygon, metadata = metadata)
 
     @staticmethod
-    def from_coords(coords_list, metadata = {}):
-        polygon = alphashape(coords_list, 0.05)
-        if not polygon or isinstance(Polygon, LineString):
-            polygon = MultiPoint(coords_list).convex_hull
+    def from_bboxes_xywh(list_of_bboxes_xywh, patch_size = 14):
+        """
+        This function assumes that all the
+        """
+        coords = [[b[1], b[0]] for b in list_of_bboxes_xywh]
+        region = Region.from_coords(coords, patch_size = 14)
+        return region
+
+    @staticmethod
+    def from_coords(coords_list, metadata = {}, patch_size = 14):
+        logger = logging.getLogger(__name__)
+        coords_array = np.array(coords_list)
+
+        # Find the maximum row and column values
+        max_row_value = np.max(coords_array[:, 0])
+        max_col_value = np.max(coords_array[:, 1])
+
+        # Add patch_size to all instances of the maximum row and column values
+        coords_array[coords_array[:, 0] == max_row_value, 0] += patch_size
+        coords_array[coords_array[:, 1] == max_col_value, 1] += patch_size
+
+        coords_list = coords_array.tolist()
+
+        if len(np.unique(coords_array[:, 0])) < 3 or len(np.unique(coords_array[:, 1])) < 3:
+            polygon = MultiPoint(coords_array[:, [1,0]]).convex_hull
+        else:
+            try:
+                polygon = alphashape(coords_array[:, [1,0]], 0.0001)
+
+                if not polygon or isinstance(Polygon, LineString):
+                    print('ALPHA SHAPE NO POLYGON REVERTING TO MULTIPOINT')
+                    coords_list = [c[::-1] for c in coords_list]
+                    polygon = MultiPoint(coords_list).convex_hull
+                elif isinstance(polygon, (MultiPolygon,)):
+                    print('IN MULTI POLYGON!')
+                    polygon_new = unary_union(polygon)
+                    if isinstance(polygon_new, MultiPolygon):
+                        polygon = max(polygon.geoms, key=lambda p: p.area)
+                    else:
+                        polygon = polygon_new
+            except scipy.spatial._qhull.QhullError:
+                logger.warning('QhullError in alphashape, reverting to convex hull')
+                polygon = MultiPoint(coords_array[:, [1, 0]]).convex_hull
 
         return Region.from_polygon(polygon=polygon, metadata=metadata)
 
@@ -563,7 +632,7 @@ class Region:
         scores = sorted_df[score_column].values
         original_columns = df.columns.values.tolist()
         grouped_df = Region.group_regions_df(sorted_df, bbox_column, cluster_column_name="region_group",
-                                             max_relative_distance=max_relative_distance, score_column_name=score_column)
+                                             max_relative_distance=max_relative_distance, score_column_name=score_column, score_tolerance=0.9)
 
         original_columns.append("region_group")
         original_columns.append('region_group_score_median')
@@ -690,8 +759,18 @@ class Region:
         that cover that polygon as tightly as possible. Each region will represent a bbox of size patch_size x patch_size
         """
         # Get the bounds of the polygon
+        logger = logging.getLogger(__name__)
         polygon = self.polygon
         min_x, min_y, max_x, max_y = polygon.bounds
+
+        if min_x == max_x:
+            max_x += patch_size
+
+        if min_y == max_y:
+            max_y += patch_size
+
+        if not polygon:
+            logger.warning('BAD! range', min_x, max_x, patch_size, polygon, self.row, self.column, self.width, self.height)
 
         x_points = np.arange(min_x, max_x, patch_size)
         y_points = np.arange(min_y, max_y, patch_size)
@@ -879,9 +958,9 @@ class Region:
 
             polygon = current_region.polygon
 
-            if isinstance(polygon, Polygon):
+            if isinstance(polygon, (Polygon,)):
                 coords = np.array(polygon.exterior.coords)
-            elif isinstance(polygon, LineString):
+            elif isinstance(polygon, (LineString,)):
                 coords = np.array(polygon.coords)
 
             exterior = [coords.round().astype(np.int32)]
@@ -962,12 +1041,12 @@ if __name__ == "__main__":
     b = r.box.bounds
     im = cv2.imread(os.path.expanduser("~/Downloads/test.jpg"))
     m = im.max(axis = 2) > 250
-    m = m.astype('float').transpose(1,0)
-    coords= [(119, 91), (119, 91 + 14), (119, 91 + 28)]
+    m = m.astype('float')#.transpose(0,0)
+    coords = [[280, 280], [294, 294], [280, 280], [308, 308]]
     #coords = [tuple(list(i)[::-1]) for i in coords]
     coords = np.unique(np.round(coords, decimals=8), axis=0)  # Remove duplicate points
     region = Region.from_coords(coords)
-    new_image = np.zeros((300, 300, 3), dtype = np.uint8)
+    new_image = np.zeros((512, 512, 3), dtype = np.uint8)
     img = ImageLoader(image = new_image).draw_regions([region])
     Image.fromarray(img.image).save(os.path.expanduser("~/Downloads/output2.jpg"))
 
@@ -978,8 +1057,14 @@ if __name__ == "__main__":
     sub_regions = regions[0].to_regions(14)
     i = im.draw_regions(sub_regions)
     Image.fromarray(i.image).save(os.path.expanduser("~/Downloads/output.jpg"))
-    im2 = Region.draw(im, [r])
-    cv2.imwrite("./output.png", im2)
+
+    coords = []
+    for sub in sub_regions:
+        coords.append((sub.row, sub.column))
+
+    region = Region.from_coords(coords)
+    im2 = im.draw_regions([region])
+    cv2.imwrite(os.path.expanduser("~/Downloads/test3.jpg"), im2.image)
     print(b)
     import glob
     from dateutil import parser
